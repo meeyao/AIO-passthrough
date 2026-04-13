@@ -1,0 +1,11 @@
+.codex
+*.iso
+*.rom
+*.qcow2
+*.img
+*.log
+*.bak
+*.tmp
+*.fd
+*.xml
+!README.md

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${STATE_FILE:-/etc/passthrough/passthrough.conf}"
+if [[ -f "${STATE_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${STATE_FILE}"
+fi
+
+VM_NAME="${VM_NAME:-windows}"
+URI="${LIBVIRT_URI:-qemu:///system}"
+ACTION="${1:-start}"
+
+run_helper() {
+  local helper="$1"
+  shift
+  command -v "${helper}" >/dev/null 2>&1 || {
+    echo "missing helper: ${helper}" >&2
+    exit 1
+  }
+  exec "${helper}" "$@"
+}
+
+case "${ACTION}" in
+  start)
+    if [[ "${INSTALL_STAGE:-host-configured}" == "host-configured" ]]; then
+      echo "Host setup is done, but the VM has not been created yet." >&2
+      echo "Run: windows create" >&2
+      exit 1
+    fi
+    ;;
+  create|install)
+    shift
+    run_helper /usr/local/bin/passthrough-create-vm "$@"
+    ;;
+  autounattend)
+    shift
+    run_helper /usr/local/bin/passthrough-build-autounattend "$@"
+    ;;
+  attach-gpu)
+    shift
+    run_helper /usr/local/bin/passthrough-attach-gpu "$@"
+    ;;
+  finalize)
+    shift
+    run_helper /usr/local/bin/passthrough-attach-gpu "$@"
+    ;;
+  stop|shutdown)
+    exec virsh -c "${URI}" shutdown "${VM_NAME}"
+    ;;
+  destroy)
+    exec virsh -c "${URI}" destroy "${VM_NAME}"
+    ;;
+  reset)
+    exec virsh -c "${URI}" reset "${VM_NAME}"
+    ;;
+  reboot)
+    exec virsh -c "${URI}" reboot "${VM_NAME}"
+    ;;
+  status)
+    echo "install_stage=${INSTALL_STAGE:-unknown}"
+    exec virsh -c "${URI}" domstate "${VM_NAME}"
+    ;;
+  xml)
+    exec virsh -c "${URI}" dumpxml "${VM_NAME}"
+    ;;
+  *)
+    echo "usage: windows [start|create|install|autounattend|attach-gpu|finalize|stop|shutdown|destroy|reset|reboot|status|xml]" >&2
+    exit 2
+    ;;
+esac
+
+state="$(virsh -c "${URI}" domstate "${VM_NAME}" 2>/dev/null || true)"
+
+if [[ "${state}" == "running" ]]; then
+  echo "${VM_NAME} is already running"
+  exit 0
+fi
+
+exec virsh -c "${URI}" start "${VM_NAME}"
