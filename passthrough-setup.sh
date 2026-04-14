@@ -9,17 +9,71 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 DRY_RUN=0
 WINDOWS_ISO_URL="https://www.microsoft.com/en-us/software-download/windows11"
 VIRTIO_ISO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/"
+DOCKUR_WINDOWS_SRC="${DOCKUR_WINDOWS_SRC:-/home/${SUDO_USER:-${USER}}/github/windows/src}"
+WINHANCE_SOURCE_XML="${WINHANCE_SOURCE_XML:-/home/${SUDO_USER:-${USER}}/Downloads/autounattend.xml}"
+WINHANCE_SOURCE_URL="${WINHANCE_SOURCE_URL:-https://raw.githubusercontent.com/memstechtips/UnattendedWinstall/main/autounattend.xml}"
+WINHANCE_CACHE_XML="${WINHANCE_CACHE_XML:-/etc/passthrough/source-cache/winhance-autounattend.xml}"
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_CYAN=$'\033[36m'
+else
+  C_RESET=""
+  C_BOLD=""
+  C_DIM=""
+  C_RED=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_BLUE=""
+  C_CYAN=""
+fi
+
+ui_hr() {
+  printf '%b\n' "${C_DIM}------------------------------------------------------------------------${C_RESET}"
+}
+
+ui_space() {
+  printf '\n'
+}
+
+ui_section() {
+  ui_space
+  ui_hr
+  printf '%b%s%b\n' "${C_BOLD}${C_CYAN}" "$1" "${C_RESET}"
+  ui_hr
+}
+
+ui_kv() {
+  printf '  %b%-20s%b %s\n' "${C_DIM}" "$1" "${C_RESET}" "$2"
+}
+
+ui_note() {
+  printf '%b%s%b\n' "${C_DIM}" "$1" "${C_RESET}"
+}
+
+ui_banner() {
+  ui_hr
+  printf '%bOne-Click Passthrough%b\n' "${C_BOLD}${C_BLUE}" "${C_RESET}"
+  printf '%bInteractive Windows GPU passthrough setup%b\n' "${C_DIM}" "${C_RESET}"
+  ui_hr
+}
 
 log() {
-  printf '[%s] %s\n' "${SCRIPT_NAME}" "$*"
+  printf '%b[%s]%b %s\n' "${C_BLUE}" "${SCRIPT_NAME}" "${C_RESET}" "$*"
 }
 
 warn() {
-  printf '[%s] WARN: %s\n' "${SCRIPT_NAME}" "$*" >&2
+  printf '%b[%s] WARN:%b %s\n' "${C_YELLOW}" "${SCRIPT_NAME}" "${C_RESET}" "$*" >&2
 }
 
 fail() {
-  printf '[%s] ERROR: %s\n' "${SCRIPT_NAME}" "$*" >&2
+  printf '%b[%s] ERROR:%b %s\n' "${C_RED}" "${SCRIPT_NAME}" "${C_RESET}" "$*" >&2
   exit 1
 }
 
@@ -69,16 +123,28 @@ packages_for_manager() {
   local manager="$1"
   case "${manager}" in
     pacman)
-      printf '%s\n' "qemu-full virt-manager virt-install dnsmasq bridge-utils edk2-ovmf swtpm pciutils libvirt mkinitcpio xorriso"
+      printf '%s\n' "qemu-full virt-manager virt-install dnsmasq bridge-utils edk2-ovmf swtpm pciutils libvirt mkinitcpio xorriso jq curl file libarchive p7zip"
       ;;
     apt)
-      printf '%s\n' "qemu-system-x86 qemu-utils virt-manager virtinst dnsmasq-base bridge-utils ovmf swtpm-tools pciutils libvirt-daemon-system libvirt-clients xorriso"
+      printf '%s\n' "qemu-system-x86 qemu-utils virt-manager virtinst dnsmasq-base bridge-utils ovmf swtpm-tools pciutils libvirt-daemon-system libvirt-clients xorriso jq curl file libarchive-tools p7zip-full"
       ;;
     dnf)
-      printf '%s\n' "qemu-kvm qemu-img virt-manager virt-install dnsmasq bridge-utils edk2-ovmf swtpm pciutils libvirt libvirt-daemon-config-network xorriso"
+      printf '%s\n' "qemu-kvm qemu-img virt-manager virt-install dnsmasq bridge-utils edk2-ovmf swtpm pciutils libvirt libvirt-daemon-config-network xorriso jq curl file bsdtar p7zip"
       ;;
     zypper)
-      printf '%s\n' "qemu-kvm qemu-tools virt-manager virt-install dnsmasq bridge-utils ovmf swtpm pciutils libvirt xorriso"
+      printf '%s\n' "qemu-kvm qemu-tools virt-manager virt-install dnsmasq bridge-utils ovmf swtpm pciutils libvirt xorriso jq curl file libarchive p7zip"
+      ;;
+    *)
+      printf '%s\n' ""
+      ;;
+  esac
+}
+
+package_manager_note() {
+  local manager="$1"
+  case "${manager}" in
+    pacman)
+      printf '%s\n' "AUR/yay is not required for the default toolchain."
       ;;
     *)
       printf '%s\n' ""
@@ -109,16 +175,75 @@ install_packages() {
   esac
 }
 
+check_commands_present() {
+  local missing=() cmd
+  for cmd in "$@"; do
+    command -v "${cmd}" >/dev/null 2>&1 || missing+=("${cmd}")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    printf '%s\n' "${missing[@]}"
+    return 1
+  fi
+  return 0
+}
+
+post_install_validation() {
+  local manager="$1"
+  local required_commands recommended_commands missing_required=() missing_recommended=()
+  local required_units missing_units=() unit
+
+  required_commands=(
+    awk sed grep curl jq file lspci lsmod modprobe virsh systemctl
+  )
+  recommended_commands=(
+    virt-install qemu-img xorriso
+  )
+
+  if [[ "${manager}" == "pacman" ]]; then
+    recommended_commands+=(mkinitcpio)
+  fi
+
+  while IFS= read -r unit; do
+    [[ -n "${unit}" ]] || continue
+    if ! systemctl list-unit-files "${unit}" >/dev/null 2>&1; then
+      missing_units+=("${unit}")
+    fi
+  done < <(printf '%s\n' libvirtd.service libvirtd.socket)
+
+  while IFS= read -r unit; do
+    [[ -n "${unit}" ]] || continue
+    missing_required+=("${unit}")
+  done < <(check_commands_present "${required_commands[@]}" || true)
+
+  while IFS= read -r unit; do
+    [[ -n "${unit}" ]] || continue
+    missing_recommended+=("${unit}")
+  done < <(check_commands_present "${recommended_commands[@]}" || true)
+
+  if (( ${#missing_units[@]} > 0 )); then
+    fail "Missing expected libvirt unit files after package install: ${missing_units[*]}"
+  fi
+  if (( ${#missing_required[@]} > 0 )); then
+    fail "Missing required commands after package install: ${missing_required[*]}"
+  fi
+  if (( ${#missing_recommended[@]} > 0 )); then
+    warn "Still missing recommended commands after package install: ${missing_recommended[*]}"
+  fi
+}
+
 preflight_dependencies() {
-  local manager missing_required=() missing_recommended=() pkg_list
+  local manager missing_required=() missing_recommended=() pkg_list manager_note
   local required_commands recommended_commands cmd
 
   required_commands=(
-    awk sed grep lspci lsmod modprobe virsh systemctl
+    awk sed grep curl jq file lspci lsmod modprobe virsh systemctl
   )
   recommended_commands=(
-    mkinitcpio virt-install qemu-img xorriso
+    virt-install qemu-img xorriso
   )
+  if [[ "$(detect_package_manager)" == "pacman" ]]; then
+    recommended_commands+=(mkinitcpio)
+  fi
 
   for cmd in "${required_commands[@]}"; do
     command -v "${cmd}" >/dev/null 2>&1 || missing_required+=("${cmd}")
@@ -133,6 +258,7 @@ preflight_dependencies() {
 
   manager="$(detect_package_manager)"
   pkg_list="$(packages_for_manager "${manager}")"
+  manager_note="$(package_manager_note "${manager}")"
 
   if (( ${#missing_required[@]} > 0 )); then
     warn "Missing required commands: ${missing_required[*]}"
@@ -143,10 +269,12 @@ preflight_dependencies() {
 
   if [[ -n "${pkg_list}" ]]; then
     printf 'Suggested packages for %s:\n  %s\n' "${manager}" "${pkg_list}" >&2
+    [[ -n "${manager_note}" ]] && printf '%s\n' "${manager_note}" >&2
     if confirm "Install the suggested packages now?" "y"; then
       # shellcheck disable=SC2206
       local pkgs=( ${pkg_list} )
       install_packages "${manager}" "${pkgs[@]}"
+      post_install_validation "${manager}"
     fi
   else
     warn "Could not determine install package names automatically."
@@ -155,6 +283,9 @@ preflight_dependencies() {
   for cmd in "${required_commands[@]}"; do
     command -v "${cmd}" >/dev/null 2>&1 || fail "Missing required command after preflight: ${cmd}"
   done
+  if [[ "${manager}" != "unknown" ]]; then
+    post_install_validation "${manager}"
+  fi
 }
 
 ensure_dir() {
@@ -178,6 +309,32 @@ write_file() {
     return 0
   fi
   printf '%s' "$1" > "${path}"
+}
+
+available_space_gb() {
+  local target="${1:-/var/lib/libvirt/images}"
+  df -BG "${target}" 2>/dev/null | awk 'NR==2 {gsub(/G/, "", $4); print $4; exit}'
+}
+
+required_space_gb() {
+  local disk_size_gb="${1:-64}"
+  local iso_overhead_gb="${2:-10}"
+  printf '%s\n' "$((disk_size_gb + iso_overhead_gb))"
+}
+
+check_disk_space() {
+  local target="$1"
+  local disk_size_gb="$2"
+  local required available
+  required="$(required_space_gb "${disk_size_gb}" "10")"
+  available="$(available_space_gb "${target}" || true)"
+  [[ -n "${available}" ]] || {
+    warn "Could not determine free disk space for ${target}"
+    return 0
+  }
+  if (( available < required )); then
+    fail "Insufficient free space at ${target}: ${available}G available, ${required}G required (${disk_size_gb}G VM disk + ~10G install media overhead)."
+  fi
 }
 
 detect_cpu_vendor() {
@@ -283,6 +440,49 @@ windows_language_name() {
   esac
 }
 
+windows_language_desc() {
+  case "$1" in
+    ar) printf 'Arabic\n' ;;
+    de) printf 'German\n' ;;
+    en-gb|en) printf 'English\n' ;;
+    es) printf 'Spanish\n' ;;
+    fr) printf 'French\n' ;;
+    it) printf 'Italian\n' ;;
+    ja) printf 'Japanese\n' ;;
+    ko) printf 'Korean\n' ;;
+    nl) printf 'Dutch\n' ;;
+    pl) printf 'Polish\n' ;;
+    pt-br) printf 'Portuguese\n' ;;
+    ru) printf 'Russian\n' ;;
+    tr) printf 'Turkish\n' ;;
+    uk) printf 'Ukrainian\n' ;;
+    zh) printf 'Chinese\n' ;;
+    *) printf 'English\n' ;;
+  esac
+}
+
+windows_language_culture() {
+  case "$1" in
+    ar) printf 'ar-SA\n' ;;
+    de) printf 'de-DE\n' ;;
+    en-gb) printf 'en-GB\n' ;;
+    en) printf 'en-US\n' ;;
+    es) printf 'es-ES\n' ;;
+    fr) printf 'fr-FR\n' ;;
+    it) printf 'it-IT\n' ;;
+    ja) printf 'ja-JP\n' ;;
+    ko) printf 'ko-KR\n' ;;
+    nl) printf 'nl-NL\n' ;;
+    pl) printf 'pl-PL\n' ;;
+    pt-br) printf 'pt-BR\n' ;;
+    ru) printf 'ru-RU\n' ;;
+    tr) printf 'tr-TR\n' ;;
+    uk) printf 'uk-UA\n' ;;
+    zh) printf 'zh-CN\n' ;;
+    *) printf 'en-US\n' ;;
+  esac
+}
+
 prompt_windows_version() {
   local default="${1:-win11x64}"
   local answer normalized
@@ -371,6 +571,14 @@ discover_virtio_iso() {
 
 discover_windows_iso() {
   local candidate pattern
+  for candidate in \
+    /var/lib/libvirt/images/windows-install.iso \
+    /var/lib/libvirt/boot/windows-install.iso; do
+    [[ -f "${candidate}" ]] && {
+      printf '%s\n' "${candidate}"
+      return 0
+    }
+  done
   for pattern in \
     "/home/${SUDO_USER:-${USER}}/Downloads/*.iso" \
     "/home/${SUDO_USER:-${USER}}/*.iso"; do
@@ -400,10 +608,10 @@ prompt() {
   local default="${2:-}"
   local answer
   if [[ -n "${default}" ]]; then
-    read -r -p "${message} [${default}]: " answer
+    read -r -p "$(printf '%b›%b %s %b[%s]%b: ' "${C_GREEN}" "${C_RESET}" "${message}" "${C_DIM}" "${default}" "${C_RESET}")" answer
     printf '%s\n' "${answer:-$default}"
   else
-    read -r -p "${message}: " answer
+    read -r -p "$(printf '%b›%b %s: ' "${C_GREEN}" "${C_RESET}" "${message}")" answer
     printf '%s\n' "${answer}"
   fi
 }
@@ -414,9 +622,75 @@ confirm() {
   local suffix='[y/N]'
   local answer
   [[ "${default}" == "y" ]] && suffix='[Y/n]'
-  read -r -p "${message} ${suffix}: " answer
+  read -r -p "$(printf '%b?%b %s %b%s%b: ' "${C_BLUE}" "${C_RESET}" "${message}" "${C_DIM}" "${suffix}" "${C_RESET}")" answer
   answer="${answer:-$default}"
   [[ "${answer}" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+prompt_windows_iso_strategy() {
+  local detected="${1:-}"
+  local answer
+
+  while :; do
+    ui_section "Windows Media" >&2
+    if [[ -n "${detected}" && -f "${detected}" ]]; then
+      ui_note "Detected local Windows ISO: ${detected}" >&2
+      ui_note "Choose how you want to continue:" >&2
+      printf '  %b1)%b Use detected ISO\n' "${C_BLUE}" "${C_RESET}" >&2
+      printf '  %b2)%b Enter a different ISO path\n' "${C_BLUE}" "${C_RESET}" >&2
+      printf '  %b3)%b Download Windows ISO automatically\n' "${C_BLUE}" "${C_RESET}" >&2
+      answer="$(prompt "Windows ISO option" "1")"
+      case "${answer}" in
+        1|use|detected) printf 'detected\n'; return 0 ;;
+        2|path|manual) printf 'manual\n'; return 0 ;;
+        3|download|auto) printf 'download\n'; return 0 ;;
+      esac
+    else
+      ui_note "No local Windows ISO was detected." >&2
+      ui_note "Choose how you want to continue:" >&2
+      printf '  %b1)%b Enter a Windows ISO path\n' "${C_BLUE}" "${C_RESET}" >&2
+      printf '  %b2)%b Download Windows ISO automatically\n' "${C_BLUE}" "${C_RESET}" >&2
+      answer="$(prompt "Windows ISO option" "2")"
+      case "${answer}" in
+        1|path|manual) printf 'manual\n'; return 0 ;;
+        2|download|auto) printf 'download\n'; return 0 ;;
+      esac
+    fi
+    warn "Choose one of the listed Windows ISO options."
+  done
+}
+
+choose_windows_iso() {
+  local detected="${1:-}"
+  local version_id="${2:-win11x64}"
+  local language_id="${3:-en}"
+  local strategy answer
+
+  strategy="$(prompt_windows_iso_strategy "${detected}")"
+  case "${strategy}" in
+    detected)
+      printf '%s\n' "${detected}"
+      return 0
+      ;;
+    manual)
+      prompt_iso_path "Windows ISO path" "" "${WINDOWS_ISO_URL}" "1" "${version_id}" "${language_id}"
+      return 0
+      ;;
+    download)
+      answer="/var/lib/libvirt/images/windows-install.iso"
+      ui_note "Automatic download target: ${answer}" >&2
+      if download_windows_iso "${answer}" "${version_id}" "${language_id}" >&2; then
+        printf '%s\n' "${answer}"
+        return 0
+      fi
+      warn "Automatic Windows ISO download failed."
+      ui_note "Official download page: ${WINDOWS_ISO_URL}" >&2
+      prompt_iso_path "Windows ISO path" "" "${WINDOWS_ISO_URL}" "1" "${version_id}" "${language_id}"
+      return 0
+      ;;
+  esac
+
+  fail "Could not determine how to obtain the Windows ISO."
 }
 
 prompt_iso_path() {
@@ -445,15 +719,6 @@ prompt_iso_path() {
       if [[ "${required}" == "1" ]]; then
         warn "${label} is required."
         printf '%s\n' "Official download page: ${url}" >&2
-        if [[ "${label}" == "Windows ISO path" ]] && confirm "Try automatic Windows ISO download to /var/lib/libvirt/images/windows-install.iso?" "n"; then
-          answer="/var/lib/libvirt/images/windows-install.iso"
-          if download_windows_iso "${answer}" "${version_id}" "${language_id}"; then
-            printf '%s\n' "${answer}"
-            return 0
-          fi
-          warn "Automatic Windows ISO download failed."
-          printf '%s\n' "Official download page: ${url}" >&2
-        fi
         continue
       fi
       printf '\n'
@@ -461,6 +726,12 @@ prompt_iso_path() {
     fi
 
     if [[ -f "${answer}" ]]; then
+      if [[ "${label}" == *ISO* ]] && ! validate_iso_file "${answer}" "${label}" 104857600; then
+        warn "Choose a valid ISO image for ${label}."
+        printf '%s\n' "Official download page: ${url}" >&2
+        detected=""
+        continue
+      fi
       printf '%s\n' "${answer}"
       return 0
     fi
@@ -469,6 +740,80 @@ prompt_iso_path() {
     printf '%s\n' "Official download page: ${url}" >&2
     detected=""
   done
+}
+
+file_size_bytes() {
+  local path="$1"
+  stat -c '%s' "${path}" 2>/dev/null || wc -c < "${path}" 2>/dev/null
+}
+
+validate_iso_file() {
+  local path="$1"
+  local label="${2:-ISO}"
+  local min_size_bytes="${3:-104857600}"
+  local size description
+
+  [[ -f "${path}" ]] || return 1
+  size="$(file_size_bytes "${path}" || true)"
+  [[ -n "${size}" && "${size}" =~ ^[0-9]+$ ]] || {
+    warn "Could not determine size for ${label}: ${path}"
+    return 1
+  }
+  if (( size < min_size_bytes )); then
+    warn "${label} looks too small to be valid: ${path} (${size} bytes)."
+    return 1
+  fi
+
+  if command -v file >/dev/null 2>&1; then
+    description="$(file -b "${path}" 2>/dev/null || true)"
+    case "${description}" in
+      *ISO\ 9660*|*UDF\ filesystem*|*DOS/MBR\ boot\ sector*)
+        return 0
+        ;;
+      *HTML*|*XML*|*ASCII\ text*|*Unicode\ text*|*JSON\ text*)
+        warn "${label} is not an ISO image: ${path} (${description})"
+        return 1
+        ;;
+    esac
+  fi
+
+  return 0
+}
+
+validate_winhance_source_xml() {
+  local path="$1"
+  [[ -f "${path}" ]] || return 1
+  grep -q '<Extensions xmlns="urn:winhance:unattend">' "${path}" 2>/dev/null || return 1
+  grep -q 'Winhancements\.ps1' "${path}" 2>/dev/null || return 1
+}
+
+resolve_winhance_source_xml() {
+  local preferred="${1:-}"
+  local tmp_output
+
+  if [[ -n "${preferred}" && -f "${preferred}" ]]; then
+    validate_winhance_source_xml "${preferred}" || fail "Winhance source XML is not valid: ${preferred}"
+    printf '%s\n' "${preferred}"
+    return 0
+  fi
+
+  if [[ -f "${WINHANCE_CACHE_XML}" ]]; then
+    validate_winhance_source_xml "${WINHANCE_CACHE_XML}" || fail "Cached Winhance source XML is invalid: ${WINHANCE_CACHE_XML}"
+    printf '%s\n' "${WINHANCE_CACHE_XML}"
+    return 0
+  fi
+
+  need_download_cmds curl
+  ensure_dir "$(dirname "${WINHANCE_CACHE_XML}")"
+  tmp_output="$(mktemp "${WINHANCE_CACHE_XML}.tmp.XXXXXX")"
+  if run curl -L --fail --output "${tmp_output}" "${WINHANCE_SOURCE_URL}" && validate_winhance_source_xml "${tmp_output}"; then
+    mv -f "${tmp_output}" "${WINHANCE_CACHE_XML}"
+    log "Cached Winhance source XML at ${WINHANCE_CACHE_XML}"
+    printf '%s\n' "${WINHANCE_CACHE_XML}"
+    return 0
+  fi
+  rm -f "${tmp_output}"
+  fail "Could not obtain a valid Winhance source XML from ${WINHANCE_SOURCE_URL}"
 }
 
 prompt_number() {
@@ -499,47 +844,250 @@ need_download_cmds() {
   done
 }
 
+windows_download_user_agent() {
+  local browser_version
+  browser_version="$((124 + ($(date +%s) - 1710892800) / 2419200))"
+  printf 'Mozilla/5.0 (X11; Linux x86_64; rv:%s.0) Gecko/20100101 Firefox/%s.0\n' "${browser_version}" "${browser_version}"
+}
+
+windows_static_download_url() {
+  local version_id="${1:-win11x64}"
+  local language_id="${2:-en}"
+
+  case "${language_id}" in
+    en|en-gb) ;;
+    *) return 1 ;;
+  esac
+
+  case "${version_id}" in
+    win11x64)
+      printf '%s\n' "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENT_CONSUMER_x64FRE_en-us.iso"
+      ;;
+    win11x64-enterprise-eval)
+      printf '%s\n' "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso"
+      ;;
+    win11x64-enterprise-iot-eval|win11x64-enterprise-ltsc-eval)
+      printf '%s\n' "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1.240331-1435.ge_release_CLIENT_IOT_LTSC_EVAL_x64FRE_en-us.iso"
+      ;;
+    win10x64)
+      printf '%s\n' "https://dl.bobpony.com/windows/10/en-us_windows_10_22h2_x64.iso"
+      ;;
+    win10x64-enterprise-eval)
+      printf '%s\n' "https://software-static.download.prss.microsoft.com/dbazure/988969d5-f34g-4e03-ac9d-1f9786c66750/19045.2006.220908-0225.22h2_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso"
+      ;;
+    win10x64-enterprise-ltsc-eval)
+      printf '%s\n' "https://software-download.microsoft.com/download/pr/19044.1288.211006-0501.21h2_release_svc_refresh_CLIENT_LTSC_EVAL_x64FRE_en-us.iso"
+      ;;
+    win2025-eval)
+      printf '%s\n' "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
+      ;;
+    win2022-eval)
+      printf '%s\n' "https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso"
+      ;;
+    win2019-eval)
+      printf '%s\n' "https://software-download.microsoft.com/download/pr/17763.737.190906-2324.rs5_release_svc_refresh_SERVER_EVAL_x64FRE_en-us_1.iso"
+      ;;
+    win2019-hv)
+      printf '%s\n' "https://software-download.microsoft.com/download/pr/17763.557.190612-0019.rs5_release_svc_refresh_SERVERHYPERCORE_OEM_x64FRE_en-us.ISO"
+      ;;
+    win2016-eval)
+      printf '%s\n' "https://software-download.microsoft.com/download/F/3/C/F3C4E1E7-972A-4E22-879E-2AA1FA286A6A/Windows_Server_2016_Datacenter_EVAL_en-us_14393_refresh.ISO"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_windows_retail_download_url() {
+  local version_id="${1:-win11x64}"
+  local language_id="${2:-en}"
+  local page_url="" windows_version="" download_type="1"
+  local user_agent language_name session_id page_html product_edition_id profile sku_json sku_id iso_json iso_url rc
+
+  case "${version_id}" in
+    win11x64) windows_version="11" ;;
+    win10x64) windows_version="10" ;;
+    *) return 1 ;;
+  esac
+
+  user_agent="$(windows_download_user_agent)"
+  language_name="$(windows_language_name "${language_id}")"
+  page_url="https://www.microsoft.com/en-us/software-download/windows${windows_version}"
+  [[ "${version_id}" == "win10x64" ]] && page_url+="ISO"
+  profile="606624d44113"
+  session_id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
+  session_id="${session_id//[![:print:]]/}"
+
+  page_html="$(curl --silent --max-time 30 --user-agent "${user_agent}" --header "Accept:" --max-filesize 1M --fail --proto =https --tlsv1.2 --http1.1 -- "${page_url}")" || return 1
+  product_edition_id="$(printf '%s' "${page_html}" | grep -Eo '<option value="[0-9]+">Windows' | cut -d '"' -f2 | head -n1 | tr -cd '0-9' | head -c 16)"
+  [[ -n "${product_edition_id}" ]] || return 1
+
+  curl --silent --max-time 30 --output /dev/null --user-agent "${user_agent}" --header "Accept:" --max-filesize 100K --fail --proto =https --tlsv1.2 --http1.1 -- \
+    "https://vlscppe.microsoft.com/tags?org_id=y6jn8c31&session_id=${session_id}" || return 1
+
+  sku_json="$(curl --silent --max-time 30 --request GET --user-agent "${user_agent}" --referer "${page_url}" --header "Accept:" --max-filesize 100K --fail --proto =https --tlsv1.2 --http1.1 -- \
+    "https://www.microsoft.com/software-download-connector/api/getskuinformationbyproductedition?profile=${profile}&ProductEditionId=${product_edition_id}&SKU=undefined&friendlyFileName=undefined&Locale=en-US&sessionID=${session_id}")" || return 1
+  { sku_id="$(printf '%s' "${sku_json}" | jq -r --arg LANG "${language_name}" '.Skus?[]? | select(.Language==$LANG).Id' | head -n1)"; rc=$?; } || :
+  [[ -n "${sku_id}" && "${sku_id}" != "null" && "${rc}" -eq 0 ]] || return 1
+
+  iso_json="$(curl --silent --max-time 30 --request GET --user-agent "${user_agent}" --referer "${page_url}" --header "Accept:" --max-filesize 100K --proto =https --tlsv1.2 --http1.1 -- \
+    "https://www.microsoft.com/software-download-connector/api/GetProductDownloadLinksBySku?profile=${profile}&ProductEditionId=undefined&SKU=${sku_id}&friendlyFileName=undefined&Locale=en-US&sessionID=${session_id}")" || return 1
+  [[ -n "${iso_json}" ]] || return 1
+
+  if printf '%s' "${iso_json}" | grep -q "Sentinel marked this request as rejected."; then
+    warn "Microsoft blocked the automated retail download request based on your IP address."
+    return 1
+  fi
+  if printf '%s' "${iso_json}" | grep -q "We are unable to complete your request at this time."; then
+    warn "Microsoft rejected the automated retail download request at this time."
+    return 1
+  fi
+
+  { iso_url="$(printf '%s' "${iso_json}" | jq -r '.ProductDownloadOptions?[]? | select(.DownloadType==1).Uri' | head -n1)"; rc=$?; } || :
+  [[ -n "${iso_url}" && "${iso_url}" != "null" && "${rc}" -eq 0 ]] || return 1
+  printf '%s\n' "${iso_url}"
+}
+
+resolve_windows_eval_download_url() {
+  local version_id="${1:-win11x64-enterprise-eval}"
+  local language_id="${2:-en}"
+  local user_agent culture country url html filter links resolved
+
+  case "${version_id}" in
+    win11x64-enterprise-eval) url="https://www.microsoft.com/en-us/evalcenter/download-windows-11-enterprise" ;;
+    win11x64-enterprise-iot-eval|win11x64-enterprise-ltsc-eval) url="https://www.microsoft.com/en-us/evalcenter/download-windows-11-iot-enterprise-ltsc-eval" ;;
+    win10x64-enterprise-eval|win10x64-enterprise-ltsc-eval) url="https://www.microsoft.com/en-us/evalcenter/download-windows-10-enterprise" ;;
+    win2025-eval) url="https://www.microsoft.com/en-us/evalcenter/download-windows-server-2025" ;;
+    win2022-eval) url="https://www.microsoft.com/en-us/evalcenter/download-windows-server-2022" ;;
+    win2019-eval) url="https://www.microsoft.com/en-us/evalcenter/download-windows-server-2019" ;;
+    win2019-hv) url="https://www.microsoft.com/en-us/evalcenter/download-hyper-v-server-2019" ;;
+    win2016-eval) url="https://www.microsoft.com/en-us/evalcenter/download-windows-server-2016" ;;
+    *) return 1 ;;
+  esac
+
+  user_agent="$(windows_download_user_agent)"
+  culture="$(windows_language_culture "${language_id}")"
+  country="${culture#*-}"
+  html="$(curl --silent --max-time 30 --user-agent "${user_agent}" --location --max-filesize 1M --fail --proto =https --tlsv1.2 --http1.1 -- "${url}")" || return 1
+  [[ -n "${html}" ]] || return 1
+
+  filter="https://go.microsoft.com/fwlink/?linkid=[0-9]\\+&clcid=0x[0-9a-z]\\+&culture=${culture,,}&country=${country,,}"
+  if ! printf '%s' "${html}" | grep -io "${filter}" >/dev/null; then
+    filter="https://go.microsoft.com/fwlink/p/?linkid=[0-9]\\+&clcid=0x[0-9a-z]\\+&culture=${culture,,}&country=${country,,}"
+  fi
+  links="$(printf '%s' "${html}" | grep -io "${filter}" || true)"
+  [[ -n "${links}" ]] || return 1
+
+  case "${version_id}" in
+    win11x64-enterprise-eval|win11x64-enterprise-iot-eval|win11x64-enterprise-ltsc-eval|win2025-eval|win2022-eval|win2019-eval|win2019-hv|win2016-eval)
+      resolved="$(printf '%s\n' "${links}" | head -n1)"
+      ;;
+    win10x64-enterprise-eval)
+      resolved="$(printf '%s\n' "${links}" | head -n2 | tail -n1)"
+      ;;
+    win10x64-enterprise-ltsc-eval)
+      resolved="$(printf '%s\n' "${links}" | head -n4 | tail -n1)"
+      ;;
+    *) return 1 ;;
+  esac
+
+  [[ -n "${resolved}" ]] || return 1
+  curl --silent --max-time 30 --user-agent "${user_agent}" --location --output /dev/null --write-out "%{url_effective}" --head --fail --proto =https --tlsv1.2 --http1.1 -- "${resolved}" || return 1
+}
+
+resolve_windows_download_url() {
+  local version_id="${1:-win11x64}"
+  local language_id="${2:-en}"
+  local url=""
+
+  url="$(windows_static_download_url "${version_id}" "${language_id}" || true)"
+  if [[ -n "${url}" ]]; then
+    printf '%s\n' "${url}"
+    return 0
+  fi
+
+  case "${version_id}" in
+    win10x64|win11x64)
+      resolve_windows_retail_download_url "${version_id}" "${language_id}"
+      ;;
+    win11x64-enterprise-*|win10x64-enterprise-*|win2025-eval|win2022-eval|win2019-eval|win2019-hv|win2016-eval)
+      resolve_windows_eval_download_url "${version_id}" "${language_id}" || windows_static_download_url "${version_id}" "${language_id}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+dockur_windows_download_url() {
+  local version_id="${1:-win11x64}"
+  local language_id="${2:-en}"
+  local define_sh="${DOCKUR_WINDOWS_SRC}/define.sh"
+  local mido_sh="${DOCKUR_WINDOWS_SRC}/mido.sh"
+  local description
+
+  [[ -f "${define_sh}" && -f "${mido_sh}" ]] || return 1
+  description="Windows $(windows_language_desc "${language_id}")"
+
+  /usr/bin/env bash -lc '
+set -euo pipefail
+VERSION_ID="$1"
+LANGUAGE_ID="$2"
+DESCRIPTION="$3"
+DEFINE_SH="$4"
+MIDO_SH="$5"
+PLATFORM="x64"
+DEBUG="N"
+VERIFY="N"
+SUPPORT="https://github.com/dockur/windows"
+MIDO_URL=""
+info() { :; }
+html() { :; }
+warn() { printf "%s\n" "$*" >&2; }
+error() { printf "%s\n" "$*" >&2; return 1; }
+source "$DEFINE_SH"
+source "$MIDO_SH"
+getWindows "$VERSION_ID" "$LANGUAGE_ID" "$DESCRIPTION" >/dev/null
+printf "%s\n" "$MIDO_URL"
+' bash "${version_id}" "${language_id}" "${description}" "${define_sh}" "${mido_sh}" 2>/dev/null
+}
+
 download_windows_iso() {
   local output_path="$1"
   local version_id="${2:-win11x64}"
   local language_id="${3:-en}"
-  local page_url page_html product_edition_id session_id sku_json sku_id iso_json iso_url user_agent language_name
+  local iso_url tmp_output
+  local -a curl_download_cmd
 
   need_download_cmds curl jq
-
-  user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
-  language_name="$(windows_language_name "${language_id}")"
-
-  case "${version_id}" in
-    win11x64) page_url="https://www.microsoft.com/en-us/software-download/windows11" ;;
-    win10x64) page_url="https://www.microsoft.com/en-us/software-download/windows10ISO" ;;
-    *)
-      warn "Automatic download is only implemented for Windows 10/11 retail media right now."
-      return 1
-      ;;
-  esac
-
-  page_html="$(curl -fsSL -A "${user_agent}" "${page_url}")" || return 1
-  product_edition_id="$(printf '%s' "${page_html}" | grep -Eo '<option value="[0-9]+">Windows' | cut -d '"' -f2 | head -n1)"
-  [[ -n "${product_edition_id}" ]] || return 1
-
-  session_id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)"
-  curl -fsSL -A "${user_agent}" "https://vlscppe.microsoft.com/tags?org_id=y6jn8c31&session_id=${session_id}" >/dev/null || return 1
-
-  sku_json="$(curl -fsSL -A "${user_agent}" \
-    --referer "${page_url}" \
-    "https://www.microsoft.com/software-download-connector/api/getskuinformationbyproductedition?profile=606624d44113&ProductEditionId=${product_edition_id}&SKU=undefined&friendlyFileName=undefined&Locale=en-US&sessionID=${session_id}")" || return 1
-  sku_id="$(printf '%s' "${sku_json}" | jq -r --arg LANG "${language_name}" '.Skus[] | select(.Language==$LANG).Id' | head -n1)"
-  [[ -n "${sku_id}" && "${sku_id}" != "null" ]] || return 1
-
-  iso_json="$(curl -fsSL -A "${user_agent}" \
-    --referer "${page_url}" \
-    "https://www.microsoft.com/software-download-connector/api/GetProductDownloadLinksBySku?profile=606624d44113&ProductEditionId=undefined&SKU=${sku_id}&friendlyFileName=undefined&Locale=en-US&sessionID=${session_id}")" || return 1
-  iso_url="$(printf '%s' "${iso_json}" | jq -r '.ProductDownloadOptions[] | select(.DownloadType==1).Uri' | head -n1)"
-  [[ -n "${iso_url}" && "${iso_url}" != "null" ]] || return 1
+  iso_url="$(dockur_windows_download_url "${version_id}" "${language_id}" || true)"
+  if [[ -n "${iso_url}" ]]; then
+    log "Resolved Windows ISO URL via Dockur logic: ${iso_url}"
+  else
+    iso_url="$(resolve_windows_download_url "${version_id}" "${language_id}" || true)"
+  fi
+  [[ -n "${iso_url}" ]] || {
+    warn "Could not resolve a Windows ISO download URL for ${version_id} (${language_id})."
+    return 1
+  }
+  [[ "${iso_url}" == http* ]] || {
+    warn "Resolved Windows ISO URL is invalid: ${iso_url}"
+    return 1
+  }
+  log "Resolved Windows ISO URL: ${iso_url}"
 
   ensure_dir "$(dirname "${output_path}")"
-  run curl -L --fail --output "${output_path}" "${iso_url}"
+  tmp_output="$(mktemp "${output_path}.tmp.XXXXXX")"
+  curl_download_cmd=(curl -L --fail --output "${tmp_output}")
+  if [[ -t 1 ]]; then
+    curl_download_cmd+=(--progress-bar)
+  fi
+  curl_download_cmd+=("${iso_url}")
+  if run "${curl_download_cmd[@]}" && validate_iso_file "${tmp_output}" "Windows ISO" 536870912; then
+    mv -f "${tmp_output}" "${output_path}"
+    return 0
+  fi
+  rm -f "${tmp_output}"
+  return 1
 }
 
 list_gpus() {
@@ -606,6 +1154,66 @@ select_gpu() {
   printf '%s\n' "${selected}"
 }
 
+usb_ids_file() {
+  local candidate
+  for candidate in /usr/share/hwdata/usb.ids /usr/share/misc/usb.ids; do
+    [[ -f "${candidate}" ]] && {
+      printf '%s\n' "${candidate}"
+      return 0
+    }
+  done
+  return 1
+}
+
+usb_vendor_name() {
+  local vendor_id="${1,,}"
+  local file
+  file="$(usb_ids_file || true)"
+  [[ -n "${file}" ]] || return 1
+  awk -v vendor="${vendor_id}" '
+    tolower($1) == vendor && $0 !~ /^\t/ {
+      $1=""
+      sub(/^[[:space:]]+/, "", $0)
+      print
+      exit
+    }' "${file}"
+}
+
+usb_product_name() {
+  local vendor_id="${1,,}"
+  local product_id="${2,,}"
+  local file
+  file="$(usb_ids_file || true)"
+  [[ -n "${file}" ]] || return 1
+  awk -v vendor="${vendor_id}" -v product="${product_id}" '
+    BEGIN { in_vendor = 0 }
+    $0 !~ /^\t/ {
+      in_vendor = (tolower($1) == vendor)
+      next
+    }
+    in_vendor && $0 ~ /^\t[0-9a-fA-F]{4}[[:space:]]+/ {
+      line=$0
+      sub(/^\t/, "", line)
+      split(line, parts, /[[:space:]]+/)
+      if (tolower(parts[1]) == product) {
+        sub(/^[[:space:]]*[0-9a-fA-F]{4}[[:space:]]+/, "", line)
+        print line
+        exit
+      }
+    }' "${file}"
+}
+
+usb_device_blacklisted() {
+  local vendor="${1,,}"
+  local product="${2,,}"
+  case "${vendor}:${product}" in
+    1d6b:0001|1d6b:0002|1d6b:0003|1d6b:0004)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 list_usb_controllers() {
   lspci -Dnn | awk '
     /USB controller|USB 3|xHCI|EHCI|OHCI/ {
@@ -632,17 +1240,22 @@ recommended_usb_controller() {
 }
 
 list_usb_devices() {
-  local dev vendor product manufacturer product_name busnum devnum line
+  local dev vendor product manufacturer product_name busnum devnum line vendor_name product_label
   for dev in /sys/bus/usb/devices/*; do
     [[ -f "${dev}/idVendor" && -f "${dev}/idProduct" ]] || continue
     [[ -f "${dev}/busnum" && -f "${dev}/devnum" ]] || continue
     vendor="$(<"${dev}/idVendor")"
     product="$(<"${dev}/idProduct")"
+    usb_device_blacklisted "${vendor}" "${product}" && continue
     manufacturer="$(<"${dev}/manufacturer" 2>/dev/null || true)"
     product_name="$(<"${dev}/product" 2>/dev/null || true)"
     busnum="$(<"${dev}/busnum")"
     devnum="$(<"${dev}/devnum")"
-    line="${vendor}:${product}|bus $(printf '%03d' "${busnum}") device $(printf '%03d' "${devnum}") - ${manufacturer} ${product_name}"
+    vendor_name="$(usb_vendor_name "${vendor}" || true)"
+    product_label="$(usb_product_name "${vendor}" "${product}" || true)"
+    [[ -z "${manufacturer}" ]] && manufacturer="${vendor_name}"
+    [[ -z "${product_name}" ]] && product_name="${product_label}"
+    line="${vendor}:${product}|bus $(printf '%03d' "${busnum}") device $(printf '%03d' "${devnum}") - ${manufacturer:-Unknown Vendor} ${product_name:-Unknown Product}"
     printf '%s\n' "${line}" | sed 's/[[:space:]]\+/ /g; s/ - $//'
   done | awk '!seen[$1]++'
 }
@@ -652,7 +1265,7 @@ render_plain_menu() {
   local index=1
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
-    printf '%d) %s\n' "${index}" "${line}" >&2
+    printf '  %b%2d)%b %s\n' "${C_BLUE}" "${index}" "${C_RESET}" "${line}" >&2
     index=$((index + 1))
   done <<< "${entries}"
 }
@@ -709,33 +1322,58 @@ select_usb_controller() {
 
 select_usb_devices() {
   local entries="$1"
-  local selection selected_lines="" idx item entry class
+  local selection action selected_lines="" item entry class
   render_plain_menu "${entries}"
-  printf 'Select USB device numbers separated by commas. Blank means none.\n' >&2
-  selection="$(prompt "USB devices to pass through")"
-  [[ -z "${selection}" ]] && return 0
-  selection="${selection// /}"
-  IFS=',' read -r -a items <<< "${selection}"
-  for item in "${items[@]}"; do
-    [[ "${item}" =~ ^[1-9][0-9]*$ ]] || {
-      warn "Skipping invalid USB selection: ${item}"
-      continue
-    }
-    entry="$(printf '%s\n' "${entries}" | sed -n "${item}p")"
-    [[ -n "${entry}" ]] || {
-      warn "Skipping missing USB selection: ${item}"
-      continue
-    }
-    class="$(classify_usb_entry "${entry}")"
-    case "${class}" in
-      keyboard|mouse|receiver)
-        warn "Selected ${class}: ${entry}"
-        warn "If this is your only host input device, you may lock yourself out during VM use."
+  ui_note "Pick one or more USB devices. Commands: number, comma list, list, clear, done."
+  while :; do
+    if [[ -n "${selected_lines}" ]]; then
+      printf '%bCurrently selected:%b\n' "${C_BOLD}" "${C_RESET}" >&2
+      printf '%s' "${selected_lines}" | awk 'NF && !seen[$0]++ { printf "  - %s\n", $0 }' >&2
+    else
+      printf '%bCurrently selected:%b none\n' "${C_BOLD}" "${C_RESET}" >&2
+    fi
+    action="$(prompt "USB devices to pass through" "done")"
+    action="${action// /}"
+    case "${action,,}" in
+      "")
+        continue
+        ;;
+      done)
+        printf '%s' "${selected_lines}" | awk 'NF && !seen[$0]++'
+        return 0
+        ;;
+      list)
+        render_plain_menu "${entries}"
+        continue
+        ;;
+      clear)
+        selected_lines=""
+        continue
         ;;
     esac
-    selected_lines="${selected_lines}${entry}"$'\n'
+    IFS=',' read -r -a items <<< "${action}"
+    for item in "${items[@]}"; do
+      [[ "${item}" =~ ^[1-9][0-9]*$ ]] || {
+        warn "Skipping invalid USB selection: ${item}"
+        continue
+      }
+      entry="$(printf '%s\n' "${entries}" | sed -n "${item}p")"
+      [[ -n "${entry}" ]] || {
+        warn "Skipping missing USB selection: ${item}"
+        continue
+      }
+      class="$(classify_usb_entry "${entry}")"
+      case "${class}" in
+        keyboard|mouse|receiver)
+          warn "Selected ${class}: ${entry}"
+          warn "If this is your only host input device, you may lock yourself out during VM use."
+          ;;
+      esac
+      selected_lines="${selected_lines}${entry}"$'\n'
+    done
+    selected_lines="$(printf '%s' "${selected_lines}" | awk 'NF && !seen[$0]++')"
+    [[ -n "${selected_lines}" ]] && selected_lines="${selected_lines}"$'\n'
   done
-  printf '%s' "${selected_lines}" | awk 'NF && !seen[$0]++'
 }
 
 detect_bootloader() {
@@ -996,7 +1634,9 @@ configure_libvirt() {
   run systemctl enable --now libvirtd.service
   run systemctl enable --now libvirtd.socket
   run virsh net-autostart default
-  run virsh net-start default || true
+  if [[ "$(virsh net-info default 2>/dev/null | awk -F': *' '/^Active:/ {print tolower($2); exit}')" != "yes" ]]; then
+    run virsh net-start default
+  fi
   run systemctl restart libvirtd.service
 }
 
@@ -1020,7 +1660,10 @@ write_state_file() {
   local usb_mode="${17}"
   local usb_controller_pci="${18}"
   local usb_device_ids="${19}"
-  local install_stage="${20}"
+  local windows_test_mode="${20}"
+  local winhance_payload="${21}"
+  local install_profile="${22}"
+  local install_stage="${23}"
   local body
 
   body=$(cat <<EOF
@@ -1043,6 +1686,9 @@ WINDOWS_LANGUAGE="${windows_language}"
 USB_MODE="${usb_mode}"
 USB_CONTROLLER_PCI="${usb_controller_pci}"
 USB_DEVICE_IDS="${usb_device_ids}"
+WINDOWS_TEST_MODE="${windows_test_mode}"
+WINHANCE_PAYLOAD="${winhance_payload}"
+INSTALL_PROFILE="${install_profile}"
 INSTALL_STAGE="${install_stage}"
 EOF
 )
@@ -1056,13 +1702,13 @@ create_status_script() {
 echo "Install stage: ${INSTALL_STAGE:-unknown}"
 case "${INSTALL_STAGE:-unknown}" in
   host-configured)
-    echo "Next step: run 'windows create' to build the initial Spice install VM."
+    echo "Next step: run './windows' from the repo directory to build the initial Spice install VM."
     ;;
   spice-install)
-    echo "Next step: complete Windows install and guest tools in the Spice VM, then shut it down and run 'windows finalize'."
+    echo "Next step: complete Windows install in the Spice VM, then shut it down and run './windows' again."
     ;;
   gpu-passthrough)
-    echo "Next step: start the VM normally with 'windows start'."
+    echo "Next step: run './windows' from the repo directory to start the passthrough VM."
     ;;
 esac
 echo
@@ -1104,6 +1750,11 @@ virsh net-info default 2>/dev/null || true
 echo
 echo "postboot service:"
 systemctl status --no-pager passthrough-postboot.service 2>/dev/null || true
+echo
+echo "Desktop flow:"
+echo "  1. cd into the one-click-passthrough repo"
+echo "  2. run ./windows"
+echo "  3. if no viewer opens, open the VM in virt-manager or virt-viewer"
 EOF
 )
 
@@ -1195,11 +1846,16 @@ create_vm_helper_scripts() {
   local usb_mode="$7"
   local usb_controller_pci="$8"
   local usb_device_ids="$9"
-  local create_body attach_body video_xml audio_xml unattend_xml setupcomplete_body build_unattend_body set_stage_body
+  local windows_test_mode="${10}"
+  local winhance_payload="${11}"
+  local create_body attach_body video_xml audio_xml unattend_xml setupcomplete_body build_unattend_body build_windows_body set_stage_body
   local controller_xml usb_attach_block id_pair vendor product usb_xml_path
   local user_name_placeholder
+  local first_logon_dse_xml="" setupcomplete_dse_body="" first_logon_reboot_xml="" first_logon_debloat_xml=""
+  local specialize_run_commands_xml="" unattend_extensions_xml="" winhance_extensions_xml="" winhance_source_xml=""
 
   user_name_placeholder="${SUDO_USER:-${USER:-nick}}"
+  winhance_source_xml="${WINHANCE_SOURCE_XML}"
 
   set_stage_body=$(cat <<'EOF'
 #!/usr/bin/env bash
@@ -1217,6 +1873,10 @@ STAGE="${1:-}"
 }
 
 tmp="$(mktemp)"
+if [[ ! -w "${STATE_FILE}" ]]; then
+  echo "State file is not writable; skipping stage update to ${STAGE}" >&2
+  exit 0
+fi
 awk -v stage="${STAGE}" '
   BEGIN { done = 0 }
   /^INSTALL_STAGE=/ {
@@ -1235,6 +1895,81 @@ rm -f "${tmp}"
 echo "Set install stage to ${STAGE}"
 EOF
 )
+
+  if [[ "${windows_test_mode}" == "1" ]]; then
+    first_logon_dse_xml=$(cat <<'EOF'
+        <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Order>1</Order>
+          <Description>Enable Windows test mode</Description>
+          <CommandLine>cmd /c bcdedit /set {current} testsigning on</CommandLine>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Order>2</Order>
+          <Description>Relax driver signature enforcement</Description>
+          <CommandLine>cmd /c bcdedit /set {current} nointegritychecks on</CommandLine>
+        </SynchronousCommand>
+EOF
+)
+    first_logon_reboot_xml=$(cat <<'EOF'
+        <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+          <Order>9</Order>
+          <Description>Reboot into Windows test mode</Description>
+          <CommandLine>shutdown.exe /r /t 5 /f /c "Rebooting once to enable Windows test mode"</CommandLine>
+        </SynchronousCommand>
+EOF
+)
+    setupcomplete_dse_body+=$'bcdedit /set {current} testsigning on >nul 2>&1\r\n'
+    setupcomplete_dse_body+=$'bcdedit /set {current} nointegritychecks on >nul 2>&1\r\n'
+  fi
+
+  if [[ "${winhance_payload}" == "1" ]]; then
+    winhance_source_xml="$(resolve_winhance_source_xml "${winhance_source_xml}")"
+    winhance_extensions_xml="$(sed -n '/<Extensions xmlns="urn:winhance:unattend">/,/<\/Extensions>/p' "${winhance_source_xml}")"
+    [[ -n "${winhance_extensions_xml}" ]] || fail "Could not extract the Winhance Extensions block from ${winhance_source_xml}."
+    unattend_extensions_xml="${winhance_extensions_xml}"
+    specialize_run_commands_xml=$(cat <<'EOF'
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Load full Winhance payload from unattend extensions</Description>
+          <Path>powershell.exe -NoProfile -WindowStyle Hidden -Command "$xml = [xml]::new(); $xml.Load('C:\Windows\Panther\unattend.xml'); $sb = [scriptblock]::Create( $xml.unattend.Extensions.ExtractScript ); Invoke-Command -ScriptBlock $sb -ArgumentList $xml;"</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Description>Allow local account creation without online requirement</Description>
+          <Path>reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Description>Disable network adapters during OOBE</Description>
+          <Path>powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Get-NetAdapter | Disable-NetAdapter -Confirm:\$false"</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Description>Enable .NET Framework 3.5 from Windows installation media</Description>
+          <Path>powershell.exe -NoProfile -WindowStyle Hidden -Command "foreach($d in 'C','D','E','F','G','H','I','J','K'){$src=Join-Path ($d+':') 'sources\sxs';if(Test-Path $src\*.cab){dism /Online /Enable-Feature /FeatureName:NetFx3 /All /LimitAccess /Source:$src;break}}"</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Description>Run full Winhance payload</Description>
+          <Path>powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\ProgramData\Winhance\Unattend\Scripts\Winhancements.ps1"</Path>
+        </RunSynchronousCommand>
+EOF
+)
+  else
+    specialize_run_commands_xml=$(cat <<'EOF'
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Allow local account creation without online requirement</Description>
+          <Path>reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Description>Disable network adapters during OOBE</Description>
+          <Path>powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Get-NetAdapter | Disable-NetAdapter -Confirm:\$false"</Path>
+        </RunSynchronousCommand>
+EOF
+)
+  fi
 
   unattend_xml=$(cat <<EOF
 <?xml version="1.0" encoding="utf-8"?>
@@ -1350,16 +2085,7 @@ EOF
   <settings pass="specialize">
     <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <RunSynchronous>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>1</Order>
-          <Description>Allow local account creation without online requirement</Description>
-          <Path>reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
-        </RunSynchronousCommand>
-        <RunSynchronousCommand wcm:action="add">
-          <Order>2</Order>
-          <Description>Disable network adapters during OOBE</Description>
-          <Path>powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Get-NetAdapter | Disable-NetAdapter -Confirm:\$false"</Path>
-        </RunSynchronousCommand>
+${specialize_run_commands_xml}
       </RunSynchronous>
     </component>
     <component name="Microsoft-Windows-Security-SPP-UX" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
@@ -1408,56 +2134,61 @@ EOF
         </LocalAccounts>
       </UserAccounts>
       <FirstLogonCommands>
+${first_logon_dse_xml}
         <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-          <Order>1</Order>
+          <Order>3</Order>
           <Description>Re-enable network adapters</Description>
           <CommandLine>powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Get-NetAdapter | Enable-NetAdapter -Confirm:\$false"</CommandLine>
         </SynchronousCommand>
         <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-          <Order>2</Order>
+          <Order>4</Order>
           <Description>Install virtio guest tools if mounted</Description>
           <CommandLine>cmd /c for %D in (D E F G H I J K L M) do @if exist %D:\virtio-win-guest-tools.exe start /wait "" %D:\virtio-win-guest-tools.exe /quiet /norestart</CommandLine>
         </SynchronousCommand>
         <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-          <Order>3</Order>
+          <Order>5</Order>
           <Description>Install SPICE guest tools if mounted</Description>
           <CommandLine>cmd /c for %D in (D E F G H I J K L M) do @if exist %D:\spice-guest-tools.exe start /wait "" %D:\spice-guest-tools.exe /S</CommandLine>
         </SynchronousCommand>
         <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-          <Order>4</Order>
+          <Order>6</Order>
           <Description>Hide Edge first-run experience</Description>
           <CommandLine>reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Edge" /v "HideFirstRunExperience" /t REG_DWORD /d 1 /f</CommandLine>
         </SynchronousCommand>
         <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-          <Order>5</Order>
+          <Order>7</Order>
           <Description>Show file extensions</Description>
           <CommandLine>reg.exe add "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v "HideFileExt" /t REG_DWORD /d 0 /f</CommandLine>
         </SynchronousCommand>
         <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-          <Order>6</Order>
+          <Order>8</Order>
           <Description>Disable hibernation</Description>
           <CommandLine>cmd /C POWERCFG -H OFF</CommandLine>
         </SynchronousCommand>
         <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-          <Order>7</Order>
+          <Order>10</Order>
           <Description>Disable unsupported hardware notices</Description>
           <CommandLine>reg.exe add "HKCU\Control Panel\UnsupportedHardwareNotificationCache" /v SV1 /t REG_DWORD /d 0 /f</CommandLine>
         </SynchronousCommand>
         <SynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-          <Order>8</Order>
+          <Order>11</Order>
           <Description>Disable unsupported hardware notices second flag</Description>
           <CommandLine>reg.exe add "HKCU\Control Panel\UnsupportedHardwareNotificationCache" /v SV2 /t REG_DWORD /d 0 /f</CommandLine>
         </SynchronousCommand>
+${first_logon_debloat_xml}
+${first_logon_reboot_xml}
       </FirstLogonCommands>
       <TimeZone>UTC</TimeZone>
     </component>
   </settings>
+${unattend_extensions_xml}
   <cpi:offlineImage cpi:source="wim://windows/install.wim#Windows 11 Pro" xmlns:cpi="urn:schemas-microsoft-com:cpi" />
 </unattend>
 EOF
 )
 
   setupcomplete_body=$'@echo off\r\n'
+  setupcomplete_body+="${setupcomplete_dse_body}"
   setupcomplete_body+=$'for %%D in (D E F G H I J K L M) do (\r\n'
   setupcomplete_body+=$'  if exist %%D:\\virtio-win-guest-tools.exe start /wait "" %%D:\\virtio-win-guest-tools.exe /quiet /norestart\r\n'
   setupcomplete_body+=$'  if exist %%D:\\spice-guest-tools.exe start /wait "" %%D:\\spice-guest-tools.exe /S\r\n'
@@ -1477,23 +2208,13 @@ DISK_SIZE_GB="\${DISK_SIZE_GB:-\${DISK_SIZE_GB:-120}}"
 MEMORY_MB="\${MEMORY_MB:-\${MEMORY_MB:-16384}}"
 VCPUS="\${VCPUS:-\${VCPUS:-8}}"
 VIRTIO_MEDIA="\${2:-\${VIRTIO_ISO}}"
-UNATTEND_ISO="/etc/passthrough/\${VM_NAME}-autounattend.iso"
-
-[[ -n "\${WINDOWS_ISO}" ]] || {
-  echo "usage: passthrough-create-vm [/path/to/windows.iso] [/path/to/virtio.iso]" >&2
-  echo "Windows ISO download page: ${WINDOWS_ISO_URL}" >&2
-  exit 2
-}
+INSTALL_PROFILE="\${INSTALL_PROFILE:-standard}"
+PATCHED_WINDOWS_ISO="/var/lib/libvirt/images/\${VM_NAME}-windows-install-\${INSTALL_PROFILE}.iso"
 
 command -v virt-install >/dev/null 2>&1 || {
   echo "virt-install is required" >&2
   exit 1
 }
-command -v qemu-img >/dev/null 2>&1 || {
-  echo "qemu-img is required" >&2
-  exit 1
-}
-
 [[ -f "${ovmf_code}" ]] || {
   echo "Missing OVMF_CODE at ${ovmf_code}" >&2
   exit 1
@@ -1502,18 +2223,24 @@ command -v qemu-img >/dev/null 2>&1 || {
   echo "Missing OVMF_VARS at ${ovmf_vars}" >&2
   exit 1
 }
-[[ -f "\${WINDOWS_ISO}" ]] || {
-  echo "Windows ISO not found: \${WINDOWS_ISO}" >&2
-  echo "Download page: ${WINDOWS_ISO_URL}" >&2
+AVAILABLE_GB="\$(df -BG "\$(dirname "\${DISK_PATH}")" 2>/dev/null | awk 'NR==2 {gsub(/G/, "", \$4); print \$4; exit}')"
+REQUIRED_GB="\$((DISK_SIZE_GB + 10))"
+if [[ -n "\${AVAILABLE_GB}" ]] && (( AVAILABLE_GB < REQUIRED_GB )); then
+  echo "Insufficient free space for VM creation." >&2
+  echo "Available: \${AVAILABLE_GB}G" >&2
+  echo "Required: \${REQUIRED_GB}G (\${DISK_SIZE_GB}G VM disk + ~10G overhead)" >&2
   exit 1
-}
-
-if [[ ! -f "\${UNATTEND_ISO}" ]]; then
-  /usr/local/bin/passthrough-build-autounattend
 fi
 
-if [[ ! -f "\${DISK_PATH}" ]]; then
-  qemu-img create -f qcow2 "\${DISK_PATH}" "\${DISK_SIZE_GB}G"
+if [[ ! -f "\${PATCHED_WINDOWS_ISO}" ]]; then
+  echo "Missing patched Windows ISO: \${PATCHED_WINDOWS_ISO}" >&2
+  echo "Re-run: sudo ./passthrough-setup.sh" >&2
+  if [[ -n "\${WINDOWS_ISO}" ]]; then
+    echo "Configured base Windows ISO: \${WINDOWS_ISO}" >&2
+  else
+    echo "Windows ISO download page: ${WINDOWS_ISO_URL}" >&2
+  fi
+  exit 1
 fi
 
 cmd=(
@@ -1521,21 +2248,30 @@ cmd=(
   --connect qemu:///system
   --name "\${VM_NAME}"
   --memory "\${MEMORY_MB}"
-  --vcpus "\${VCPUS}"
-  --cpu host-passthrough
+  --vcpus "\${VCPUS},sockets=1,dies=1,cores=\${VCPUS},threads=1"
+  --cpu "host-passthrough"
   --machine q35
+  --features "acpi=on,apic=on"
   --boot "loader=${ovmf_code},loader.readonly=yes,loader.type=pflash,nvram.template=${ovmf_vars}"
-  --disk "path=\${DISK_PATH},format=qcow2,bus=sata"
-  --disk "path=\${WINDOWS_ISO},device=cdrom"
+  --clock "offset=localtime"
   --network network=default,model=e1000e
   --graphics spice
   --video qxl
   --sound ich9
+  --watchdog "itco,action=reset"
   --channel spicevmc
   --tpm backend.type=emulator,backend.version=2.0,model=tpm-crb
   --osinfo detect=on,require=off
   --noautoconsole
 )
+
+if [[ -f "\${DISK_PATH}" ]]; then
+  cmd+=(--disk "path=\${DISK_PATH},format=qcow2,bus=sata")
+else
+  cmd+=(--disk "path=\${DISK_PATH},size=\${DISK_SIZE_GB},format=qcow2,bus=sata")
+fi
+
+cmd+=(--disk "path=\${PATCHED_WINDOWS_ISO},device=cdrom")
 
 if [[ -n "\${VIRTIO_MEDIA}" && -f "\${VIRTIO_MEDIA}" ]]; then
   cmd+=(--disk "path=\${VIRTIO_MEDIA},device=cdrom")
@@ -1544,14 +2280,12 @@ else
   echo "Download page: ${VIRTIO_ISO_URL}" >&2
 fi
 
-if [[ -f "\${UNATTEND_ISO}" ]]; then
-  cmd+=(--disk "path=\${UNATTEND_ISO},device=cdrom")
-fi
-
 "\${cmd[@]}"
 /usr/local/bin/passthrough-set-stage spice-install
 echo "VM created for Spice install phase."
-echo "Finish Windows install, let guest tools run, then shut the VM down and run: windows finalize"
+echo "A Spice viewer should open automatically."
+echo "If it does not, open \${VM_NAME} in virt-manager or virt-viewer."
+echo "When Windows setup is finished and the VM is shut down, run ./windows again."
 EOF
 )
 
@@ -1563,7 +2297,7 @@ STATE_FILE="/etc/passthrough/passthrough.conf"
 source "${STATE_FILE}"
 
 SRC_DIR="/etc/passthrough/autounattend"
-OUT_ISO="/etc/passthrough/${VM_NAME}-autounattend.iso"
+OUT_ISO="/var/lib/libvirt/images/${VM_NAME}-autounattend.iso"
 
 [[ -f "${SRC_DIR}/Autounattend.xml" ]] || {
   echo "Missing ${SRC_DIR}/Autounattend.xml" >&2
@@ -1571,7 +2305,7 @@ OUT_ISO="/etc/passthrough/${VM_NAME}-autounattend.iso"
 }
 
 if command -v xorriso >/dev/null 2>&1; then
-  xorriso -as mkisofs -V AUTOUNATTEND -o "${OUT_ISO}" "${SRC_DIR}" >/dev/null 2>&1
+  xorriso -as mkisofs -V AUTOUNATTEND -o "${OUT_ISO}" "${SRC_DIR}"
 elif command -v genisoimage >/dev/null 2>&1; then
   genisoimage -quiet -V AUTOUNATTEND -o "${OUT_ISO}" "${SRC_DIR}"
 elif command -v mkisofs >/dev/null 2>&1; then
@@ -1580,6 +2314,100 @@ else
   echo "Need xorriso, genisoimage, or mkisofs to build unattended ISO" >&2
   exit 1
 fi
+
+echo "Built ${OUT_ISO}"
+EOF
+)
+
+  build_windows_body=$(cat <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="/etc/passthrough/passthrough.conf"
+source "${STATE_FILE}"
+
+SRC_DIR="/etc/passthrough/autounattend"
+BASE_ISO="${WINDOWS_ISO}"
+PROFILE="${INSTALL_PROFILE:-standard}"
+OUT_ISO="/var/lib/libvirt/images/${VM_NAME}-windows-install-${PROFILE}.iso"
+SETUPCOMPLETE="${SRC_DIR}/\$OEM\$/\$\$/Setup/Scripts/SetupComplete.cmd"
+WORKDIR="$(mktemp -d)"
+ROOT_DIR="${WORKDIR}/root"
+cleanup() {
+  rm -rf "${WORKDIR}"
+}
+trap cleanup EXIT
+
+[[ -f "${BASE_ISO}" ]] || {
+  echo "Missing Windows ISO: ${BASE_ISO}" >&2
+  exit 1
+}
+[[ -f "${SRC_DIR}/Autounattend.xml" ]] || {
+  echo "Missing ${SRC_DIR}/Autounattend.xml" >&2
+  exit 1
+}
+[[ -f "${SETUPCOMPLETE}" ]] || {
+  echo "Missing ${SETUPCOMPLETE}" >&2
+  exit 1
+}
+command -v xorriso >/dev/null 2>&1 || {
+  echo "Need xorriso to build patched Windows ISO" >&2
+  exit 1
+}
+
+extract_iso() {
+  mkdir -p "${ROOT_DIR}"
+  if command -v 7z >/dev/null 2>&1; then
+    7z x -y "-o${ROOT_DIR}" "${BASE_ISO}" >/dev/null
+    return 0
+  fi
+  if command -v bsdtar >/dev/null 2>&1; then
+    bsdtar -C "${ROOT_DIR}" -xf "${BASE_ISO}"
+    return 0
+  fi
+  echo "Need 7z or bsdtar to extract the Windows ISO" >&2
+  exit 1
+}
+
+extract_iso
+
+mkdir -p "${ROOT_DIR}/sources/\$OEM\$/\$\$/Setup/Scripts"
+cp "${SRC_DIR}/Autounattend.xml" "${ROOT_DIR}/Autounattend.xml"
+cp "${SETUPCOMPLETE}" "${ROOT_DIR}/sources/\$OEM\$/\$\$/Setup/Scripts/SetupComplete.cmd"
+
+[[ -f "${ROOT_DIR}/boot/etfsboot.com" ]] || {
+  echo "Missing BIOS boot image in extracted Windows ISO: boot/etfsboot.com" >&2
+  exit 1
+}
+
+if [[ -f "${ROOT_DIR}/efi/microsoft/boot/efisys.bin" ]]; then
+  EFI_BOOT_IMAGE="efi/microsoft/boot/efisys.bin"
+elif [[ -f "${ROOT_DIR}/efi/microsoft/boot/efisys_noprompt.bin" ]]; then
+  EFI_BOOT_IMAGE="efi/microsoft/boot/efisys_noprompt.bin"
+else
+  echo "Missing EFI boot image in extracted Windows ISO" >&2
+  exit 1
+fi
+
+VOLID="$(xorriso -indev "${BASE_ISO}" -pvd_info 2>/dev/null | awk -F': *' '/^Volume Id/ {print $2; exit}')"
+VOLID="${VOLID:-WINAUTO}"
+
+rm -f "${OUT_ISO}"
+xorriso -as mkisofs \
+  -iso-level 3 \
+  -full-iso9660-filenames \
+  -J \
+  -joliet-long \
+  -relaxed-filenames \
+  -V "${VOLID}" \
+  -o "${OUT_ISO}" \
+  -b "boot/etfsboot.com" \
+  -no-emul-boot \
+  -boot-load-size 8 \
+  -eltorito-alt-boot \
+  -e "${EFI_BOOT_IMAGE}" \
+  -no-emul-boot \
+  "${ROOT_DIR}"
 
 echo "Built ${OUT_ISO}"
 EOF
@@ -1654,7 +2482,7 @@ virsh attach-device "\${VM_NAME}" /etc/passthrough/\${VM_NAME}-gpu-video.xml --c
 virsh attach-device "\${VM_NAME}" /etc/passthrough/\${VM_NAME}-gpu-audio.xml --config
 ${usb_attach_block}/usr/local/bin/passthrough-set-stage gpu-passthrough
 echo "Attached GPU${usb_mode:+ and USB} devices to \${VM_NAME} config."
-echo "Next step: start the finalized passthrough VM with 'windows start'."
+echo "Next step: run ./windows from the repo directory to start the finalized passthrough VM."
 EOF
 )
 
@@ -1666,13 +2494,17 @@ EOF
     write_file "/etc/passthrough/${vm_name}-usb-controller.xml" "${controller_xml}"
   fi
   write_file "/usr/local/bin/passthrough-build-autounattend" "${build_unattend_body}"
+  write_file "/usr/local/bin/passthrough-build-windows-iso" "${build_windows_body}"
   write_file "/usr/local/bin/passthrough-set-stage" "${set_stage_body}"
   write_file "/usr/local/bin/passthrough-create-vm" "${create_body}"
   write_file "/usr/local/bin/passthrough-attach-gpu" "${attach_body}"
   run chmod +x /usr/local/bin/passthrough-build-autounattend
+  run chmod +x /usr/local/bin/passthrough-build-windows-iso
   run chmod +x /usr/local/bin/passthrough-set-stage
   run chmod +x /usr/local/bin/passthrough-create-vm
   run chmod +x /usr/local/bin/passthrough-attach-gpu
+  run /usr/local/bin/passthrough-build-autounattend
+  run /usr/local/bin/passthrough-build-windows-iso
 }
 
 create_single_gpu_hooks() {
@@ -1712,6 +2544,28 @@ USER_PROCESSES_TO_KILL=(
   plasma_session
   niri
   quickshell
+)
+GPU_DRIVERS_TO_UNLOAD=(
+  nvidia_drm
+  nvidia_modeset
+  nvidia_uvm
+  nvidia
+  amdgpu
+  radeon
+  nouveau
+  xe
+  i915
+)
+GPU_DRIVERS_TO_RELOAD=(
+  xe
+  i915
+  nvidia
+  nvidia_modeset
+  nvidia_uvm
+  nvidia_drm
+  amdgpu
+  radeon
+  nouveau
 )
 
 log() {
@@ -1794,6 +2648,14 @@ wait_for_module_gone() {
   return 1
 }
 
+unload_gpu_drivers() {
+  local module
+  modprobe -r "\${GPU_DRIVERS_TO_UNLOAD[@]}" || true
+  for module in "\${GPU_DRIVERS_TO_UNLOAD[@]}"; do
+    wait_for_module_gone "\${module}" || true
+  done
+}
+
 driver_in_use() {
   local pci="\$1"
   lspci -nnk -s "\${pci}" | awk -F': ' '/Kernel driver in use/ {print \$2; exit}'
@@ -1825,9 +2687,7 @@ if [[ -e /sys/bus/platform/drivers/efi-framebuffer/unbind ]]; then
   echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind || true
 fi
 
-modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia amdgpu radeon nouveau || true
-wait_for_module_gone "nvidia" || true
-wait_for_module_gone "amdgpu" || true
+unload_gpu_drivers
 
 modprobe vfio
 modprobe vfio_pci
@@ -1847,10 +2707,28 @@ set -euo pipefail
 
 GPU_VIDEO_NODE="${video_node}"
 GPU_AUDIO_NODE="${audio_node}"
+GPU_DRIVERS_TO_RELOAD=(
+  xe
+  i915
+  nvidia
+  nvidia_modeset
+  nvidia_uvm
+  nvidia_drm
+  amdgpu
+  radeon
+  nouveau
+)
 
 log() {
   logger -t qemu-single-gpu-release -- "\$*"
   echo "[qemu-single-gpu-release] \$*" >&2
+}
+
+reload_gpu_drivers() {
+  local module
+  for module in "\${GPU_DRIVERS_TO_RELOAD[@]}"; do
+    modprobe "\${module}" || true
+  done
 }
 
 virsh nodedev-reattach "\${GPU_AUDIO_NODE}" || true
@@ -1858,13 +2736,7 @@ virsh nodedev-reattach "\${GPU_VIDEO_NODE}" || true
 
 modprobe -r vfio_pci vfio_iommu_type1 vfio || true
 
-modprobe nvidia || true
-modprobe nvidia_modeset || true
-modprobe nvidia_uvm || true
-modprobe nvidia_drm || true
-modprobe amdgpu || true
-modprobe radeon || true
-modprobe nouveau || true
+reload_gpu_drivers
 
 for vt in /sys/class/vtconsole/vtcon*; do
   [[ -w "\${vt}/bind" ]] || continue
@@ -1885,12 +2757,22 @@ set -euo pipefail
 
 VM_NAME="${vm_name}"
 HOOK_DIR="/etc/libvirt/hooks"
+STATE_FILE="/etc/passthrough/passthrough.conf"
 
 guest="\${1:-}"
 operation="\${2:-}"
 suboperation="\${3:-}"
 
 if [[ "\${guest}" != "\${VM_NAME}" ]]; then
+  exit 0
+fi
+
+if [[ -f "\${STATE_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "\${STATE_FILE}"
+fi
+
+if [[ "\${INSTALL_STAGE:-host-configured}" != "gpu-passthrough" ]]; then
   exit 0
 fi
 
@@ -1970,8 +2852,9 @@ show_iommu_group() {
 main() {
   local mode cpu_vendor gpu_entries gpu_choice gpu_pci gpu_desc gpu_audio gpu_audio_pci
   local vfio_ids user_name vm_name bootloader ovmf_code ovmf_vars virtio_iso windows_iso
-  local vcpus memory_mb disk_size_gb windows_version windows_language
+  local vcpus memory_mb disk_size_gb windows_version windows_language windows_test_mode
   local usb_mode usb_controller_entries usb_controller_choice usb_controller_pci usb_device_entries usb_device_ids
+  local winhance_payload install_profile
 
   if [[ "${1:-}" == "--help" ]]; then
     usage
@@ -1986,6 +2869,7 @@ main() {
 
   require_root
   preflight_dependencies
+  ui_banner
 
   cpu_vendor="$(detect_cpu_vendor)"
   ovmf_code="$(discover_ovmf_code || true)"
@@ -1994,17 +2878,22 @@ main() {
   windows_iso="$(discover_windows_iso || true)"
   windows_version="win11x64"
   windows_language="en"
+  windows_test_mode="0"
+  winhance_payload="0"
+  install_profile="standard"
   usb_mode="none"
   usb_controller_pci=""
   usb_device_ids=""
   gpu_entries="$(list_gpus)"
   [[ -n "${gpu_entries}" ]] || fail "No discrete GPUs were detected with lspci."
 
+  ui_section "Host Detection"
   log "Detected CPU vendor: ${cpu_vendor}"
   [[ -n "${ovmf_code}" ]] && log "Detected OVMF code: ${ovmf_code}" || warn "No OVMF_CODE file detected."
   [[ -n "${virtio_iso}" ]] && log "Detected virtio ISO: ${virtio_iso}" || warn "No virtio ISO detected."
   [[ -n "${windows_iso}" ]] && log "Detected Windows ISO: ${windows_iso}" || warn "No Windows ISO detected."
-  printf '\nDetected GPUs:\n'
+  ui_section "GPU Selection"
+  printf '%bDetected GPUs:%b\n' "${C_BOLD}" "${C_RESET}"
   gpu_choice="$(select_gpu "${gpu_entries}")"
   gpu_pci="${gpu_choice%%|*}"
   gpu_desc="${gpu_choice#*|}"
@@ -2017,15 +2906,17 @@ main() {
     gpu_audio_pci="${gpu_audio%%|*}"
   fi
 
-  printf '\nSelected GPU: %s - %s\n' "${gpu_pci}" "${gpu_desc}"
-  printf 'Related functions:\n'
+  ui_space
+  printf '%bSelected GPU:%b %s - %s\n' "${C_BOLD}" "${C_RESET}" "${gpu_pci}" "${gpu_desc}"
+  printf '%bRelated functions:%b\n' "${C_BOLD}" "${C_RESET}"
   list_all_gpu_functions "${gpu_pci}" | while IFS='|' read -r slot desc; do
     printf '  - %s %s\n' "${slot}" "${desc}"
   done
-  printf '\n'
+  ui_space
   show_iommu_group "${gpu_pci}" || true
-  printf '\n'
+  ui_space
 
+  ui_section "VM Configuration"
   while :; do
     mode="$(prompt "Choose passthrough mode (single/double)" "single")"
     case "${mode}" in
@@ -2038,9 +2929,17 @@ main() {
   vm_name="$(prompt "Libvirt VM name for hook wiring" "windows")"
   windows_version="$(prompt_windows_version "${windows_version}")"
   windows_language="$(prompt_windows_language "${windows_language}")"
+  if confirm "Enable Windows test mode and relaxed driver signature enforcement?" "n"; then
+    windows_test_mode="1"
+  fi
+  if confirm "Use the full Winhance+virtio install profile instead of standard+virtio?" "n"; then
+    winhance_payload="1"
+    install_profile="winhance"
+  fi
   vcpus="$(prompt_number "VM vCPU count" "8" "1")"
   memory_mb="$(prompt_number "VM memory in MB" "16384" "1024")"
   disk_size_gb="$(prompt_number "VM disk size in GB" "120" "32")"
+  check_disk_space "/var/lib/libvirt/images" "${disk_size_gb}"
   usb_controller_entries="$(list_usb_controllers || true)"
   if [[ -n "${usb_controller_entries}" ]]; then
     usb_mode="$(prompt_usb_mode "controller")"
@@ -2062,43 +2961,46 @@ main() {
   else
     warn "No separate USB controllers detected. USB passthrough wizard skipped."
   fi
-  windows_iso="$(prompt_iso_path "Windows ISO path" "${windows_iso}" "${WINDOWS_ISO_URL}" "1" "${windows_version}" "${windows_language}")"
+  windows_iso="$(choose_windows_iso "${windows_iso}" "${windows_version}" "${windows_language}")"
   virtio_iso="$(prompt_iso_path "virtio ISO path" "${virtio_iso}" "${VIRTIO_ISO_URL}")"
   vfio_ids="$(device_ids_for_bus "${gpu_pci}")"
   [[ -n "${vfio_ids}" ]] || fail "Could not derive PCI IDs for ${gpu_pci}"
 
-  printf '\nPlanned changes:\n'
-  printf '  - Mode: %s-GPU passthrough\n' "${mode}"
-  printf '  - GPU bus: %s\n' "${gpu_pci%.*}"
-  printf '  - VFIO IDs: %s\n' "${vfio_ids}"
-  printf '  - User: %s\n' "${user_name}"
-  printf '  - VM name: %s\n' "${vm_name}"
-  printf '  - Windows version: %s\n' "${windows_version}"
-  printf '  - Windows language: %s\n' "${windows_language}"
-  printf '  - vCPUs: %s\n' "${vcpus}"
-  printf '  - Memory: %s MB\n' "${memory_mb}"
-  printf '  - Disk: %s GB\n' "${disk_size_gb}"
-  printf '  - USB passthrough mode: %s\n' "${usb_mode}"
+  ui_section "Plan Review"
+  ui_kv "Mode" "${mode}-GPU passthrough"
+  ui_kv "GPU bus" "${gpu_pci%.*}"
+  ui_kv "VFIO IDs" "${vfio_ids}"
+  ui_kv "User" "${user_name}"
+  ui_kv "VM name" "${vm_name}"
+  ui_kv "Windows version" "${windows_version}"
+  ui_kv "Windows language" "${windows_language}"
+  ui_kv "Windows test mode" "$([[ "${windows_test_mode}" == "1" ]] && printf 'enabled' || printf 'disabled')"
+  ui_kv "Install profile" "${install_profile}+virtio"
+  ui_kv "vCPUs" "${vcpus}"
+  ui_kv "Memory" "${memory_mb} MB"
+  ui_kv "Disk" "${disk_size_gb} GB"
+  ui_kv "USB mode" "${usb_mode}"
   if [[ -n "${usb_controller_pci}" ]]; then
-    printf '  - USB controller: %s\n' "${usb_controller_pci}"
+    ui_kv "USB controller" "${usb_controller_pci}"
   fi
   if [[ -n "${usb_device_ids}" ]]; then
-    printf '  - USB devices: %s\n' "$(printf '%s' "${usb_device_ids}" | paste -sd',' -)"
+    ui_kv "USB devices" "$(printf '%s' "${usb_device_ids}" | paste -sd',' -)"
   fi
-  printf '  - Windows ISO: %s\n' "${windows_iso:-unset}"
-  printf '  - virtio ISO: %s\n' "${virtio_iso:-unset}"
-  printf '  - Backups: %s\n\n' "${BACKUP_DIR}"
+  ui_kv "Windows ISO" "${windows_iso:-unset}"
+  ui_kv "virtio ISO" "${virtio_iso:-unset}"
+  ui_kv "Backups" "${BACKUP_DIR}"
 
   confirm "Proceed with these changes?" "y" || exit 0
 
+  ui_section "Applying Changes"
   bootloader="$(configure_bootloader "${mode}" "${vfio_ids}" "${cpu_vendor}")"
   update_mkinitcpio "${mode}"
   configure_modprobe "${mode}" "${vfio_ids}" "${cpu_vendor}"
   configure_libvirt "${user_name}"
-  write_state_file "${mode}" "${user_name}" "${vm_name}" "${gpu_pci}" "${gpu_audio_pci}" "${vfio_ids}" "${bootloader}" "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" "${windows_iso}" "${vcpus}" "${memory_mb}" "${disk_size_gb}" "${windows_version}" "${windows_language}" "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" "host-configured"
+  write_state_file "${mode}" "${user_name}" "${vm_name}" "${gpu_pci}" "${gpu_audio_pci}" "${vfio_ids}" "${bootloader}" "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" "${windows_iso}" "${vcpus}" "${memory_mb}" "${disk_size_gb}" "${windows_version}" "${windows_language}" "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" "${windows_test_mode}" "${winhance_payload}" "${install_profile}" "host-configured"
   create_status_script
   create_postboot_service
-  create_vm_helper_scripts "${vm_name}" "${gpu_pci}" "${gpu_audio_pci}" "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}"
+  create_vm_helper_scripts "${vm_name}" "${gpu_pci}" "${gpu_audio_pci}" "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" "${windows_test_mode}" "${winhance_payload}"
 
   if [[ "${mode}" == "single" ]]; then
     create_single_gpu_hooks "${vm_name}" "${user_name}" "${gpu_pci}" "${gpu_audio_pci}"
@@ -2111,28 +3013,42 @@ main() {
     run mkinitcpio -P
   fi
 
-  printf '\nCompleted.\n'
-  printf '  - Reboot required: yes\n'
-  printf '  - Mode configured: %s-GPU passthrough\n' "${mode}"
-  printf '  - Backups stored in: %s\n' "${BACKUP_DIR}"
-  printf '  - Status helper: /usr/local/bin/passthrough-status\n'
-  printf '  - VM create helper: /usr/local/bin/passthrough-create-vm\n'
-  printf '  - GPU attach helper: /usr/local/bin/passthrough-attach-gpu\n'
-  printf '\nAfter reboot, verify with:\n'
-  printf '  passthrough-status\n'
-  printf '  systemctl status passthrough-postboot.service\n'
-  printf '  cat /var/log/passthrough-postboot.log\n'
-  printf '\nVM lifecycle:\n'
-  printf '  passthrough-create-vm [%s] [%s]\n' "${windows_iso:-/path/to/windows.iso}" "${virtio_iso:-/path/to/virtio-win.iso}"
-  printf '  windows start   # Spice install phase\n'
-  printf '  windows shutdown\n'
-  printf '  windows finalize\n'
-  printf '  windows start   # GPU passthrough phase\n'
+  ui_section "Completed"
+  ui_kv "Reboot required" "yes"
+  ui_kv "Mode configured" "${mode}-GPU passthrough"
+  ui_kv "Backups stored in" "${BACKUP_DIR}"
+  ui_kv "Status helper" "/usr/local/bin/passthrough-status"
+  ui_kv "VM create helper" "/usr/local/bin/passthrough-create-vm"
+  ui_kv "GPU attach helper" "/usr/local/bin/passthrough-attach-gpu"
+
+  ui_section "After Reboot"
+  printf '  %b1.%b passthrough-status\n' "${C_BLUE}" "${C_RESET}"
+  printf '  %b2.%b systemctl status passthrough-postboot.service\n' "${C_BLUE}" "${C_RESET}"
+  printf '  %b3.%b cat /var/log/passthrough-postboot.log\n' "${C_BLUE}" "${C_RESET}"
+
+  ui_section "Simple Flow"
+  printf '  %b1.%b Run %b./windows%b\n' "${C_BLUE}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
+  printf '     %bThis creates and starts the first Spice install VM.%b\n' "${C_DIM}" "${C_RESET}"
+  printf '  %b2.%b A Spice viewer should open automatically.\n' "${C_BLUE}" "${C_RESET}"
+  printf '     %bIf it does not, open the VM in virt-manager or virt-viewer.%b\n' "${C_DIM}" "${C_RESET}"
+  printf '  %b3.%b Install Windows in the VM.\n' "${C_BLUE}" "${C_RESET}"
+  printf '  %b4.%b When the VM is shut down, run %b./windows%b again.\n' "${C_BLUE}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
+  printf '     %bIt will ask whether to resume the install VM or switch to GPU passthrough.%b\n' "${C_DIM}" "${C_RESET}"
+  printf '  %b5.%b After that, keep using %b./windows%b as the normal start command.\n' "${C_BLUE}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
+  if [[ "${mode}" == "single" ]]; then
+    ui_space
+    printf '%bSingle-GPU Warning%b\n' "${C_BOLD}${C_YELLOW}" "${C_RESET}"
+    printf '  %b-%b Switching to real passthrough will stop the display manager and tear down the host graphical session.\n' "${C_YELLOW}" "${C_RESET}"
+    printf '  %b-%b Browsers, Electron apps, compositors, and anything using /dev/dri/* or /dev/nvidia* may be killed.\n' "${C_YELLOW}" "${C_RESET}"
+    printf '  %b-%b CPU-only services usually survive. GPU-using containers may be interrupted if they hold the card open.\n' "${C_YELLOW}" "${C_RESET}"
+    printf '  %b-%b When the VM shuts down, the release hook should reattach the GPU and restart the display manager automatically.\n' "${C_YELLOW}" "${C_RESET}"
+  fi
   if [[ -z "${windows_iso}" ]]; then
-    printf '\nWindows ISO download page: %s\n' "${WINDOWS_ISO_URL}"
+    ui_space
+    ui_note "Windows ISO download page: ${WINDOWS_ISO_URL}"
   fi
   if [[ -z "${virtio_iso}" ]]; then
-    printf 'virtio ISO download page: %s\n' "${VIRTIO_ISO_URL}"
+    ui_note "virtio ISO download page: ${VIRTIO_ISO_URL}"
   fi
 }
 

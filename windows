@@ -9,7 +9,7 @@ fi
 
 VM_NAME="${VM_NAME:-windows}"
 URI="${LIBVIRT_URI:-qemu:///system}"
-ACTION="${1:-start}"
+ACTION="${1:-go}"
 
 run_helper() {
   local helper="$1"
@@ -21,17 +21,194 @@ run_helper() {
   exec "${helper}" "$@"
 }
 
-case "${ACTION}" in
-  start)
-    if [[ "${INSTALL_STAGE:-host-configured}" == "host-configured" ]]; then
-      echo "Host setup is done, but the VM has not been created yet." >&2
-      echo "Run: windows create" >&2
+run_helper_wait() {
+  local helper="$1"
+  shift
+  command -v "${helper}" >/dev/null 2>&1 || {
+    echo "missing helper: ${helper}" >&2
+    exit 1
+  }
+  "${helper}" "$@"
+}
+
+confirm() {
+  local message="$1"
+  local default="${2:-n}"
+  local suffix='[y/N]'
+  local answer
+  [[ "${default}" == "y" ]] && suffix='[Y/n]'
+  read -r -p "${message} ${suffix}: " answer
+  answer="${answer:-$default}"
+  [[ "${answer}" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+can_launch_viewer() {
+  [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]
+}
+
+launch_spice_viewer() {
+  can_launch_viewer || {
+    echo "VM is running. Open it with virt-manager or virt-viewer." >&2
+    return 0
+  }
+
+  if command -v virt-viewer >/dev/null 2>&1; then
+    nohup virt-viewer --connect "${URI}" "${VM_NAME}" >/dev/null 2>&1 &
+    echo "Opening ${VM_NAME} in virt-viewer..."
+    return 0
+  fi
+
+  if command -v remote-viewer >/dev/null 2>&1; then
+    nohup remote-viewer "spice://localhost?title=${VM_NAME}" >/dev/null 2>&1 &
+    echo "Opening ${VM_NAME} in remote-viewer..."
+    return 0
+  fi
+
+  if command -v virt-manager >/dev/null 2>&1; then
+    nohup virt-manager --connect "${URI}" --show-domain-console "${VM_NAME}" >/dev/null 2>&1 &
+    echo "Opening ${VM_NAME} in virt-manager..."
+    return 0
+  fi
+
+  echo "VM is running. Open it with virt-manager or virt-viewer." >&2
+}
+
+vm_state() {
+  virsh -c "${URI}" domstate "${VM_NAME}" 2>/dev/null || true
+}
+
+domain_exists() {
+  virsh -c "${URI}" dominfo "${VM_NAME}" >/dev/null 2>&1
+}
+
+domain_xml() {
+  local domain_name="${1:-${VM_NAME}}"
+  virsh -c "${URI}" dumpxml "${domain_name}" 2>/dev/null || true
+}
+
+domain_exists_named() {
+  local domain_name="${1:-${VM_NAME}}"
+  virsh -c "${URI}" dominfo "${domain_name}" >/dev/null 2>&1
+}
+
+xml_has_gpu_hostdev() {
+  local xml="$1"
+  [[ -n "${GPU_PCI:-}" ]] || return 1
+  printf '%s' "${xml}" | grep -Fq "domain='0x${GPU_PCI:0:4}' bus='0x${GPU_PCI:5:2}' slot='0x${GPU_PCI:8:2}' function='0x${GPU_PCI:11:1}'"
+}
+
+infer_stage() {
+  local xml install_name
+  install_name="${VM_NAME}-spice"
+
+  if domain_exists_named "${install_name}"; then
+    printf 'spice-install\n'
+    return 0
+  fi
+
+  if ! domain_exists; then
+    printf 'host-configured\n'
+    return 0
+  fi
+
+  xml="$(domain_xml "${VM_NAME}")"
+  if xml_has_gpu_hostdev "${xml}"; then
+    printf 'gpu-passthrough\n'
+    return 0
+  fi
+
+  printf 'spice-install\n'
+}
+
+print_next_step() {
+  case "$(infer_stage)" in
+    host-configured)
+      echo "Next step: run ./windows"
+      echo "This will create the first boot Spice install VM."
+      ;;
+    spice-install)
+      echo "Next step: run ./windows"
+      echo "If the Spice VM is off, it will ask whether to resume install or finalize."
+      ;;
+    gpu-passthrough)
+      echo "Next step: run ./windows"
+      echo "This starts the finalized GPU passthrough VM."
+      ;;
+    *)
+      echo "Next step: unknown"
+      echo "The install stage in ${STATE_FILE} is not recognized."
+      ;;
+  esac
+}
+
+run_stage_action() {
+  local state stage xml
+  state="$(vm_state)"
+  stage="$(infer_stage)"
+
+  case "${stage}" in
+    host-configured)
+      run_helper_wait /usr/local/bin/passthrough-create-vm
+      launch_spice_viewer
+      exit 0
+      ;;
+    spice-install)
+      case "${state}" in
+        running)
+          echo "${VM_NAME} is already running in the Spice install phase."
+          launch_spice_viewer
+          exit 0
+          ;;
+        shut\ off|shut\ off$|"")
+          if confirm "Windows install phase is shut down. Switch to GPU passthrough now?" "n"; then
+            /usr/local/bin/passthrough-attach-gpu
+            exec virsh -c "${URI}" start "${VM_NAME}"
+          fi
+          virsh -c "${URI}" start "${VM_NAME}"
+          launch_spice_viewer
+          exit 0
+          ;;
+        *)
+          virsh -c "${URI}" start "${VM_NAME}"
+          launch_spice_viewer
+          exit 0
+          ;;
+      esac
+      ;;
+    gpu-passthrough)
+      xml="$(domain_xml "${VM_NAME}")"
+      if ! xml_has_gpu_hostdev "${xml}"; then
+        echo "Refusing to start passthrough: ${VM_NAME} exists but does not have the configured GPU attached." >&2
+        echo "Inspect with: ./windows xml" >&2
+        exit 1
+      fi
+      if [[ "${state}" == "running" ]]; then
+        echo "${VM_NAME} is already running"
+        exit 0
+      fi
+      exec virsh -c "${URI}" start "${VM_NAME}"
+      ;;
+    *)
+      echo "Unknown install stage: ${stage}" >&2
       exit 1
+      ;;
+  esac
+}
+
+case "${ACTION}" in
+  go)
+    run_stage_action
+    ;;
+  start)
+    if [[ "$(infer_stage)" == "host-configured" ]]; then
+      run_stage_action
     fi
     ;;
   create|install)
     shift
-    run_helper /usr/local/bin/passthrough-create-vm "$@"
+    run_helper_wait /usr/local/bin/passthrough-create-vm "$@"
+    launch_spice_viewer
+    exit 0
     ;;
   autounattend)
     shift
@@ -58,14 +235,21 @@ case "${ACTION}" in
     exec virsh -c "${URI}" reboot "${VM_NAME}"
     ;;
   status)
-    echo "install_stage=${INSTALL_STAGE:-unknown}"
+    echo "install_stage=$(infer_stage)"
+    print_next_step
+    echo
     exec virsh -c "${URI}" domstate "${VM_NAME}"
+    ;;
+  next)
+    print_next_step
+    exit 0
     ;;
   xml)
     exec virsh -c "${URI}" dumpxml "${VM_NAME}"
     ;;
   *)
-    echo "usage: windows [start|create|install|autounattend|attach-gpu|finalize|stop|shutdown|destroy|reset|reboot|status|xml]" >&2
+    echo "usage: windows [start|create|install|autounattend|attach-gpu|finalize|stop|shutdown|destroy|reset|reboot|status|next|xml]" >&2
+    echo "Run ./windows with no arguments for the stage-aware one-command flow." >&2
     exit 2
     ;;
 esac
