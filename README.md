@@ -197,7 +197,7 @@ The following hardware and software combinations have been tested and are confir
 - **OS**: CachyOS (Arch-based)
 - **Kernel**: 6.18.22-1-cachyos-lts
 - **GPU**: NVIDIA RTX 3070 (GA104)
-- **CPU**: AMD Ryzen
+- **CPU**: AMD Ryzen 7 3700X
 - **VM Configuration**:
   - **Memory**: 4096 MB (Stable minimum)
   - **vCPUs**: 4 (Stable default)
@@ -207,12 +207,14 @@ The following hardware and software combinations have been tested and are confir
   - **Profiles**: Winhance + Virtio + Test Mode (DSE Off)
 
 > [!TIP]
-> If you encounter black screens or boot loops during the Spice installation phase, try backing down to **4 vCPUs** and **4096 MB RAM** temporarily. You can always increase these values in the XML after the Windows install is complete.
+> If you encounter black screens or boot loops during the passthrough on single gpu, you may be able to rescue system via SSH from a different computer or phone or tty.
 
 ---
 
 ## Troubleshooting
 
+**Windows doesn't automatically boot**
+> You may have to go to the QEMU Boot menu and select the DVD ROM option to boot into Windows. In my case I had to press it twice to boot the ISO 
 **Post-boot validation:**
 ```bash
 passthrough-status
