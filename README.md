@@ -222,7 +222,7 @@ journalctl -u display-manager.service -n 50
 
 | Project | What we borrowed |
 |---|---|
-| [AutoVirt](https://github.com/therealrinku/AutoVirt) | Anticheat flag patterns, `fmtr::box_text` UI style, softdep pattern |
+| [AutoVirt](https://github.com/Scrut1ny/AutoVirt) | Anticheat flag patterns, `fmtr::box_text` UI style, softdep pattern |
 | [VFIO-Nvidia-dynamic-unbind](https://github.com/Bensikrac/VFIO-Nvidia-dynamic-unbind) | `udevadm trigger --action=remove` KDE trick, powerdevil kill |
 | [single-gpu-passthrough wiki](https://gitlab.com/risingprismtv/single-gpu-passthrough/-/wikis/home) | `vendor_id` spoof, `smbios mode=host`, `topoext` AMD fix |
 | [Parsec-Cloud-Preparation-Tool](https://github.com/K-Gibson/Parsec-Cloud-Preparation-Tool) | VB-Cable silent install pattern for headless audio |
