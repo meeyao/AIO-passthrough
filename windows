@@ -42,6 +42,261 @@ confirm() {
   [[ "${answer}" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
+run_maybe_sudo_wait() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+gpu_drm_device_paths() {
+  local sysfs_base="$1"
+  local drm_dir entry devnode
+  drm_dir="${sysfs_base}/drm"
+  [[ -d "${drm_dir}" ]] || return 0
+
+  for entry in "${drm_dir}"/card* "${drm_dir}"/renderD*; do
+    [[ -e "${entry}" ]] || continue
+    devnode="/dev/$(basename "${entry}")"
+    [[ -e "${devnode}" ]] && printf '%s\n' "${devnode}"
+  done
+}
+
+nvidia_device_minor_for_pci() {
+  local info_file="$1"
+  [[ -f "${info_file}" ]] || return 0
+  awk -F': *' '/Device Minor/ {print $2; exit}' "${info_file}" 2>/dev/null || true
+}
+
+gpu_device_paths() {
+  local sysfs_base info_file minor
+  [[ -n "${GPU_PCI:-}" ]] || return 0
+  sysfs_base="/sys/bus/pci/devices/${GPU_PCI}"
+  [[ -d "${sysfs_base}" ]] || return 0
+
+  gpu_drm_device_paths "${sysfs_base}"
+
+  info_file="/proc/driver/nvidia/gpus/${GPU_PCI}/information"
+  minor="$(nvidia_device_minor_for_pci "${info_file}")"
+  if [[ "${minor}" =~ ^[0-9]+$ ]] && [[ -e "/dev/nvidia${minor}" ]]; then
+    printf '%s\n' "/dev/nvidia${minor}"
+  fi
+}
+
+gpu_consumer_pids_for_paths() {
+  local -a devices=("$@")
+  if command -v fuser >/dev/null 2>&1; then
+    [[ "${#devices[@]}" -gt 0 ]] || return 0
+    run_maybe_sudo_wait fuser "${devices[@]}" 2>/dev/null | grep -Eo '[0-9]+' | sort -u || true
+  fi
+}
+
+gpu_consumer_cgroup() {
+  local pid="$1"
+  cat "/proc/${pid}/cgroup" 2>/dev/null || true
+}
+
+gpu_container_runtime() {
+  local pid="$1"
+  local cgroup
+  cgroup="$(gpu_consumer_cgroup "${pid}")"
+  if [[ "${cgroup}" == *docker* ]]; then
+    printf 'docker\n'
+  elif [[ "${cgroup}" == *libpod* || "${cgroup}" == *podman* ]]; then
+    printf 'podman\n'
+  fi
+}
+
+gpu_container_id() {
+  local pid="$1"
+  local cgroup id
+  cgroup="$(gpu_consumer_cgroup "${pid}")"
+  id="$(printf '%s\n' "${cgroup}" | grep -Eo '[0-9a-f]{64}|[0-9a-f]{32}' | tail -n1 || true)"
+  [[ -n "${id}" ]] && printf '%s\n' "${id}"
+}
+
+gpu_container_ref() {
+  local pid="$1"
+  local runtime id
+  runtime="$(gpu_container_runtime "${pid}")"
+  id="$(gpu_container_id "${pid}")"
+  [[ -n "${runtime}" && -n "${id}" ]] && printf '%s:%s\n' "${runtime}" "${id}"
+}
+
+container_display_name() {
+  local runtime="$1"
+  local id="$2"
+  local name=""
+  case "${runtime}" in
+    docker)
+      if command -v docker >/dev/null 2>&1; then
+        name="$(run_maybe_sudo_wait docker inspect --format '{{.Name}}' "${id}" 2>/dev/null | sed 's#^/##' || true)"
+      fi
+      ;;
+    podman)
+      if command -v podman >/dev/null 2>&1; then
+        name="$(run_maybe_sudo_wait podman inspect --format '{{.Name}}' "${id}" 2>/dev/null || true)"
+      fi
+      ;;
+  esac
+  [[ -n "${name}" ]] && printf '%s\n' "${name}" || printf '%s\n' "${id:0:12}"
+}
+
+gpu_consumer_origin() {
+  local pid="$1"
+  local cgroup runtime id name
+  cgroup="$(gpu_consumer_cgroup "${pid}")"
+  if [[ "${cgroup}" == *docker* ]]; then
+    runtime="docker"
+    id="$(gpu_container_id "${pid}")"
+    name="$(container_display_name "${runtime}" "${id}")"
+    printf 'docker container (%s)\n' "${name}"
+  elif [[ "${cgroup}" == *containerd* ]]; then
+    printf 'containerd container\n'
+  elif [[ "${cgroup}" == *kubepods* ]]; then
+    printf 'kubernetes pod\n'
+  elif [[ "${cgroup}" == *libpod* || "${cgroup}" == *podman* ]]; then
+    runtime="podman"
+    id="$(gpu_container_id "${pid}")"
+    name="$(container_display_name "${runtime}" "${id}")"
+    printf 'podman container (%s)\n' "${name}"
+  elif [[ "${cgroup}" == *user.slice* ]]; then
+    printf 'user session\n'
+  else
+    printf 'host process\n'
+  fi
+}
+
+list_gpu_containers() {
+  local -a pids=("$@")
+  local pid ref
+  for pid in "${pids[@]}"; do
+    ref="$(gpu_container_ref "${pid}")"
+    [[ -n "${ref}" ]] && printf '%s\n' "${ref}"
+  done | sort -u
+}
+
+print_gpu_containers() {
+  local -a refs=("$@")
+  local ref runtime id name
+  for ref in "${refs[@]}"; do
+    runtime="${ref%%:*}"
+    id="${ref#*:}"
+    name="$(container_display_name "${runtime}" "${id}")"
+    printf '  - %s  %s  id=%s\n' "${runtime}" "${name}" "${id:0:12}"
+  done
+}
+
+stop_container_ref() {
+  local ref="$1"
+  local runtime id
+  runtime="${ref%%:*}"
+  id="${ref#*:}"
+  case "${runtime}" in
+    docker)
+      command -v docker >/dev/null 2>&1 || return 1
+      run_maybe_sudo_wait docker stop -t 15 "${id}" >/dev/null
+      ;;
+    podman)
+      command -v podman >/dev/null 2>&1 || return 1
+      run_maybe_sudo_wait podman stop -t 15 "${id}" >/dev/null
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+gracefully_stop_gpu_containers() {
+  local -a refs=("$@")
+  local ref failed=0
+  for ref in "${refs[@]}"; do
+    stop_container_ref "${ref}" || failed=1
+  done
+  return "${failed}"
+}
+
+print_gpu_consumers() {
+  local -a pids=("$@")
+  local pid user comm origin
+  for pid in "${pids[@]}"; do
+    [[ -d "/proc/${pid}" ]] || continue
+    user="$(ps -o user= -p "${pid}" 2>/dev/null | awk '{print $1}' || true)"
+    comm="$(ps -o comm= -p "${pid}" 2>/dev/null | sed 's/^[[:space:]]*//' || true)"
+    origin="$(gpu_consumer_origin "${pid}")"
+    printf '  - pid %s  user=%s  cmd=%s  origin=%s\n' \
+      "${pid}" "${user:-unknown}" "${comm:-unknown}" "${origin}"
+  done
+}
+
+kill_gpu_consumers() {
+  local -a pids=("$@")
+  [[ "${#pids[@]}" -gt 0 ]] || return 0
+  run_maybe_sudo_wait kill -TERM "${pids[@]}" 2>/dev/null || true
+  sleep 2
+  run_maybe_sudo_wait kill -KILL "${pids[@]}" 2>/dev/null || true
+}
+
+preflight_gpu_release() {
+  local -a devices=()
+  local -a pids=()
+  local -a containers=()
+  local -a remaining=()
+
+  mapfile -t devices < <(gpu_device_paths)
+  [[ "${#devices[@]}" -gt 0 ]] || return 0
+
+  mapfile -t pids < <(gpu_consumer_pids_for_paths "${devices[@]}")
+  [[ "${#pids[@]}" -gt 0 ]] || return 0
+
+  echo "GPU preflight: the selected passthrough GPU ${GPU_PCI:-} is still in use."
+  echo "Resolved device nodes:"
+  printf '  - %s\n' "${devices[@]}"
+  echo
+  echo "Processes still holding the selected GPU:"
+  print_gpu_consumers "${pids[@]}"
+  echo
+  if [[ "${MODE:-single}" == "single" ]]; then
+    echo "This host is in single-GPU mode, so the desktop or local apps may still be using the same GPU the VM needs."
+  else
+    echo "This host is in dedicated-GPU mode, so the passthrough GPU is unexpectedly busy."
+  fi
+  echo "The libvirt hook will try to evict GPU users, but some apps and containers cannot be shut down gracefully."
+
+  mapfile -t containers < <(list_gpu_containers "${pids[@]}")
+  if [[ "${#containers[@]}" -gt 0 ]]; then
+    echo
+    echo "Detected containers using the GPU:"
+    print_gpu_containers "${containers[@]}"
+    echo
+    if confirm "Try to stop these containers gracefully before force-killing anything?" "y"; then
+      gracefully_stop_gpu_containers "${containers[@]}" || true
+      sleep 2
+      mapfile -t pids < <(gpu_consumer_pids_for_paths "${devices[@]}")
+      [[ "${#pids[@]}" -gt 0 ]] || return 0
+      echo "GPU users still present after graceful container stop:"
+      print_gpu_consumers "${pids[@]}"
+      echo
+    fi
+  fi
+
+  if ! confirm "Force-kill these GPU users before starting ${VM_NAME}?" "n"; then
+    echo "Start cancelled."
+    return 1
+  fi
+
+  kill_gpu_consumers "${pids[@]}"
+  mapfile -t remaining < <(gpu_consumer_pids_for_paths "${devices[@]}")
+  [[ "${#remaining[@]}" -gt 0 ]] || return 0
+
+  echo "Some GPU users are still present after the force-kill attempt:"
+  print_gpu_consumers "${remaining[@]}"
+  echo
+  echo "Starting ${VM_NAME} may still fail until those processes release the GPU."
+  confirm "Continue and let the libvirt hook make the final attempt?" "n"
+}
+
 can_launch_viewer() {
   [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]
 }
@@ -176,6 +431,7 @@ run_stage_action() {
             else
               sudo /usr/local/bin/passthrough-attach-gpu
             fi
+            preflight_gpu_release || exit 1
             exec virsh -c "${URI}" start "${VM_NAME}"
           fi
           echo "Leaving ${VM_NAME} shut down."
@@ -208,6 +464,7 @@ run_stage_action() {
         echo "${VM_NAME} is already running"
         exit 0
       fi
+      preflight_gpu_release || exit 1
       exec virsh -c "${URI}" start "${VM_NAME}"
       ;;
     *)
@@ -297,6 +554,10 @@ state="$(virsh -c "${URI}" domstate "${VM_NAME}" 2>/dev/null || true)"
 if [[ "${state}" == "running" ]]; then
   echo "${VM_NAME} is already running"
   exit 0
+fi
+
+if [[ "$(infer_stage)" == "gpu-passthrough" ]]; then
+  preflight_gpu_release || exit 1
 fi
 
 exec virsh -c "${URI}" start "${VM_NAME}"

@@ -7,6 +7,18 @@ source "${STATE_FILE}"
 
 log() { echo "[windows-reset-host] $*"; }
 
+selected_gpu_drm_nodes() {
+  local sysfs_base="/sys/bus/pci/devices/${GPU_PCI}"
+  local drm_dir entry devnode
+  drm_dir="${sysfs_base}/drm"
+  [[ -d "${drm_dir}" ]] || return 0
+  for entry in "${drm_dir}"/card* "${drm_dir}"/renderD*; do
+    [[ -e "${entry}" ]] || continue
+    devnode="/dev/$(basename "${entry}")"
+    [[ -e "${devnode}" ]] && printf '%s\n' "${devnode}"
+  done
+}
+
 log "Manually restoring host environment..."
 
 # 1. Rebind GPU
@@ -22,8 +34,17 @@ done
 
 # 3. Restore consoles
 for vt in /sys/class/vtconsole/vtcon*; do
-  [[ -w "${vt}/bind" ]] || echo 1 > "${vt}/bind" || true
+  [[ -w "${vt}/bind" ]] || continue
+  echo 1 > "${vt}/bind" || true
 done
+
+if [[ -e /sys/bus/platform/drivers/efi-framebuffer/bind ]]; then
+  echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/bind || true
+fi
+
+if mapfile -t drm_nodes < <(selected_gpu_drm_nodes); [[ "${#drm_nodes[@]}" -gt 0 ]]; then
+  log "Selected GPU DRM nodes after recovery: ${drm_nodes[*]}"
+fi
 
 # 4. Restart Display Manager
 log "Restarting display manager..."

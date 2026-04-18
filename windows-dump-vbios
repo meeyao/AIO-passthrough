@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="${STATE_FILE:-/etc/passthrough/passthrough.conf}"
+if [[ -f "${STATE_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${STATE_FILE}"
+fi
+
+GPU_PCI="${GPU_PCI:-}"
+if [[ -z "${GPU_PCI}" ]]; then
+  echo "Error: GPU_PCI not set in ${STATE_FILE}. Run passthrough-setup.sh first." >&2
+  exit 1
+fi
+
+# Map 0000:09:00.0 to /sys/bus/pci/devices/0000:09:00.0
+DEV="/sys/bus/pci/devices/${GPU_PCI}"
+OUT_DIR="/etc/passthrough/roms"
+OUT_FILE="${OUT_DIR}/vbios_${GPU_PCI//[:.]/_}.rom"
+
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "This script must be run as root. Re-executing with sudo..."
+  exec sudo "$0" "$@"
+fi
+
+mkdir -p "${OUT_DIR}"
+
+echo "Attempting to dump VBIOS for GPU at ${GPU_PCI}..."
+
+# Identify current driver (save it before unbinding)
+DRIVER_PATH="$(readlink "$DEV/driver" 2>/dev/null || true)"
+DRIVER_NAME="${DRIVER_PATH##*/}"
+
+# Unbind only if a driver is currently bound
+if [[ -n "$DRIVER_NAME" ]]; then
+  echo "Unbinding driver ${DRIVER_NAME} from ${GPU_PCI}..."
+  echo "${GPU_PCI}" > "$DEV/driver/unbind" || true
+fi
+
+# Enable ROM read, dump, disable
+echo "Enabling ROM reading..."
+echo 1 > "$DEV/rom" || true
+
+echo "Dumping VBIOS to ${OUT_FILE}..."
+if cat "$DEV/rom" > "${OUT_FILE}"; then
+  echo "Success! VBIOS dumped to ${OUT_FILE}"
+else
+  echo "Error: Failed to dump VBIOS. This is common if the GPU is currently in use or the ROM is shadowed." >&2
+  echo "Try running this from a TTY or after stopping the display manager." >&2
+fi
+
+echo 0 > "$DEV/rom" || true
+
+# Rebind only if we had a driver
+if [[ -n "$DRIVER_NAME" ]]; then
+  echo "Rebinding driver ${DRIVER_NAME} to ${GPU_PCI}..."
+  echo "${GPU_PCI}" > "/sys/bus/pci/drivers/$DRIVER_NAME/bind" || true
+fi
+
+echo "Done."

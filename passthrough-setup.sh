@@ -89,7 +89,7 @@ usage() {
   cat <<'EOF'
 Usage: passthrough-setup.sh [--dry-run]
 
-Interactive installer for single-GPU and double-GPU VFIO passthrough.
+Interactive installer for single-GPU and dedicated VFIO passthrough.
 It targets Arch-like hosts with either GRUB or systemd-boot and edits:
 
   - /etc/default/grub or /etc/kernel/cmdline
@@ -824,6 +824,7 @@ prompt_iso_path() {
         detected=""
         continue
       fi
+      ensure_libvirt_can_traverse_path "${answer}"
       printf '%s\n' "${answer}"
       return 0
     fi
@@ -837,6 +838,53 @@ prompt_iso_path() {
 file_size_bytes() {
   local path="$1"
   stat -c '%s' "${path}" 2>/dev/null || wc -c < "${path}" 2>/dev/null
+}
+
+ensure_libvirt_can_traverse_path() {
+  local target_path="$1"
+  local username="libvirt-qemu"
+  local current_dir
+  local -a dirs_to_check=()
+  local dir
+
+  [[ -e "${target_path}" ]] || return 0
+  current_dir="$(dirname "${target_path}")"
+
+  while [[ "${current_dir}" != "/" ]]; do
+    dirs_to_check+=("${current_dir}")
+    [[ "${current_dir}" == "/home" ]] && break
+    current_dir="$(dirname "${current_dir}")"
+  done
+
+  local index
+  for (( index=${#dirs_to_check[@]}-1; index>=0; index-- )); do
+    dir="${dirs_to_check[$index]}"
+
+    if command -v getfacl >/dev/null 2>&1 && getfacl "${dir}" 2>/dev/null | grep -q "user:${username}:.*x"; then
+      continue
+    fi
+
+    if [[ -x "${dir}" ]]; then
+      continue
+    fi
+
+    if command -v setfacl >/dev/null 2>&1; then
+      if run setfacl --modify "user:${username}:x" "${dir}" 2>/dev/null; then
+        ui_note "Granted ${username} traverse access to ${dir}" >&2
+        continue
+      fi
+    fi
+
+    if run chmod o+x "${dir}" 2>/dev/null; then
+      ui_note "Granted world traverse access to ${dir}" >&2
+      continue
+    fi
+
+    warn "Could not grant libvirt access to ${dir}. ${target_path} may not be readable by the VM."
+    return 1
+  done
+
+  return 0
 }
 
 validate_iso_file() {
@@ -1724,7 +1772,7 @@ configure_modprobe() {
     modules_body=$'vfio\nvfio_pci\nvfio_iommu_type1\n'
   else
     vfio_body=$'# Managed by passthrough-setup.sh\n'
-    vfio_body+='# Single-GPU mode uses dynamic bind/unbind via libvirt hooks.'$'\n'
+    vfio_body+='# Single-GPU mode: GPU bound/unbound via libvirt hooks.'$'\n'
     modules_body=$'vfio\nvfio_pci\nvfio_iommu_type1\n'
   fi
 
@@ -1977,7 +2025,7 @@ source "${STATE_FILE}"
     ls -l "/etc/libvirt/hooks/qemu.d/${VM_NAME}/prepare/begin/prepare.sh" 2>/dev/null || true
     ls -l "/etc/libvirt/hooks/qemu.d/${VM_NAME}/release/end/release.sh" 2>/dev/null || true
   else
-    echo "-- double-gpu vfio config --"
+    echo "-- dedicated mode vfio config --"
     grep -R "vfio" /etc/modprobe.d /etc/modules-load.d 2>/dev/null || true
   fi
   echo
@@ -2020,6 +2068,7 @@ create_vm_helper_scripts() {
   local windows_test_mode="${10}"
   local winhance_payload="${11}"
   local windows_password="${12}"
+  local existing_disk="${13:-}"
   local create_body attach_body video_xml audio_xml unattend_xml setupcomplete_body build_unattend_body build_windows_body set_stage_body
   local controller_xml usb_attach_block id_pair vendor product usb_xml_path
   local user_name_placeholder
@@ -2656,16 +2705,39 @@ EOF
   fi
 
   if [[ "${usb_mode}" == "evdev" ]]; then
-    # Generate evdev XML block
-    usb_attach_block+=$'cat <<EOF >> /etc/libvirt/qemu/${VM_NAME}.xml\n'
-    # Logic to auto-detect inputs and inject XML
-    usb_attach_block+=$'shopt -s nullglob\n'
-    usb_attach_block+=$'for dev in /dev/input/by-id/*-event-{kbd,mouse}; do\n'
-    usb_attach_block+=$'  extra_attrs=""\n'
-    usb_attach_block+=$'  [[ "$dev" == *"-event-kbd" ]] && extra_attrs=\' grab="all" repeat="on"\'\n'
-    usb_attach_block+=$'  printf \'    <input type="evdev">\\n      <source dev="%s" grabToggle="shift-shift"%s/>\\n    </input>\\n\' "$dev" "$extra_attrs"\n'
-    usb_attach_block+=$'done\n'
-    usb_attach_block+=$'EOF\n'
+    usb_attach_block+=$'python3 - "${xml_after}" <<\'"\'"\'PY\'"\'"\'\n'
+    usb_attach_block+=$'import os\n'
+    usb_attach_block+=$'import sys\n'
+    usb_attach_block+=$'import xml.etree.ElementTree as ET\n'
+    usb_attach_block+=$'\n'
+    usb_attach_block+=$'xml_path = sys.argv[1]\n'
+    usb_attach_block+=$'tree = ET.parse(xml_path)\n'
+    usb_attach_block+=$'root = tree.getroot()\n'
+    usb_attach_block+=$'devices = root.find("devices")\n'
+    usb_attach_block+=$'if devices is None:\n'
+    usb_attach_block+=$'    raise SystemExit("domain XML missing <devices>")\n'
+    usb_attach_block+=$'\n'
+    usb_attach_block+=$'seen = set()\n'
+    usb_attach_block+=$'for base in ("/dev/input/by-id", "/dev/input/by-path"):\n'
+    usb_attach_block+=$'    if not os.path.isdir(base):\n'
+    usb_attach_block+=$'        continue\n'
+    usb_attach_block+=$'    for name in sorted(os.listdir(base)):\n'
+    usb_attach_block+=$'        if not (name.endswith("-event-kbd") or name.endswith("-event-mouse")):\n'
+    usb_attach_block+=$'            continue\n'
+    usb_attach_block+=$'        dev = os.path.join(base, name)\n'
+    usb_attach_block+=$'        real = os.path.realpath(dev)\n'
+    usb_attach_block+=$'        if real in seen:\n'
+    usb_attach_block+=$'            continue\n'
+    usb_attach_block+=$'        seen.add(real)\n'
+    usb_attach_block+=$'        input_el = ET.SubElement(devices, "input", {"type": "evdev"})\n'
+    usb_attach_block+=$'        attrs = {"dev": dev, "grabToggle": "shift-shift"}\n'
+    usb_attach_block+=$'        if name.endswith("-event-kbd"):\n'
+    usb_attach_block+=$'            attrs["grab"] = "all"\n'
+    usb_attach_block+=$'            attrs["repeat"] = "on"\n'
+    usb_attach_block+=$'        ET.SubElement(input_el, "source", attrs)\n'
+    usb_attach_block+=$'\n'
+    usb_attach_block+=$'tree.write(xml_path, encoding="unicode")\n'
+    usb_attach_block+=$'PY\n'
   fi
 
   attach_body=$(cat <<EOF
@@ -2812,6 +2884,7 @@ virsh -c "\${URI}" define "\${xml_after}" >/dev/null
 virsh -c "\${URI}" attach-device "\${VM_NAME}" /etc/passthrough/\${VM_NAME}-gpu-video.xml --config
 virsh -c "\${URI}" attach-device "\${VM_NAME}" /etc/passthrough/\${VM_NAME}-gpu-audio.xml --config
 ${usb_attach_block}
+virsh -c "\${URI}" define "\${xml_after}" >/dev/null
 
 if [[ "\${EUID}" -eq 0 ]]; then
   /usr/local/bin/passthrough-set-stage gpu-passthrough || true
@@ -2844,7 +2917,11 @@ EOF
   run chmod +x /usr/local/bin/passthrough-create-vm
   run chmod +x /usr/local/bin/passthrough-attach-gpu
   run /usr/local/bin/passthrough-build-autounattend
-  run /usr/local/bin/passthrough-build-windows-iso
+  if [[ -f "${existing_disk}" ]]; then
+    ui_note "Skipping Windows ISO generation: existing VM disk will be reused"
+  else
+    run /usr/local/bin/passthrough-build-windows-iso
+  fi
 }
 
 create_single_gpu_hooks() {
@@ -2866,6 +2943,7 @@ GPU_AUDIO_NODE="${audio_node}"
 GPU_PCI="${video_pci}"
 GPU_AUDIO_PCI="${audio_pci}"
 WAIT_SECONDS=15
+STATE_DIR="/run/passthrough"
 SESSION_USER="${session_user}"
 SYSTEM_UNITS_TO_STOP=(
   display-manager.service
@@ -2889,28 +2967,32 @@ USER_PROCESSES_TO_KILL=(
   quickshell
   qs
 )
-GPU_DRIVERS_TO_UNLOAD=(
-  nvidia_drm
-  nvidia_modeset
-  nvidia_uvm
-  nvidia
-  amdgpu
-  radeon
-  nouveau
-  xe
-  i915
-)
-GPU_DRIVERS_TO_RELOAD=(
-  xe
-  i915
-  nvidia
-  nvidia_modeset
-  nvidia_uvm
-  nvidia_drm
-  amdgpu
-  radeon
-  nouveau
-)
+
+nvidia_device_minor_for_pci() {
+  local info_file="/proc/driver/nvidia/gpus/\${GPU_PCI}/information"
+  [[ -f "\${info_file}" ]] || return 0
+  awk -F': *' '/Device Minor/ {print \$2; exit}' "\${info_file}" 2>/dev/null || true
+}
+
+gpu_device_paths() {
+  local sysfs_base="/sys/bus/pci/devices/\${GPU_PCI}"
+  local drm_dir entry devnode minor
+  [[ -d "\${sysfs_base}" ]] || return 0
+
+  drm_dir="\${sysfs_base}/drm"
+  if [[ -d "\${drm_dir}" ]]; then
+    for entry in "\${drm_dir}"/card* "\${drm_dir}"/renderD*; do
+      [[ -e "\${entry}" ]] || continue
+      devnode="/dev/\$(basename "\${entry}")"
+      [[ -e "\${devnode}" ]] && printf '%s\n' "\${devnode}"
+    done
+  fi
+
+  minor="\$(nvidia_device_minor_for_pci)"
+  if [[ "\${minor}" =~ ^[0-9]+$ ]] && [[ -e "/dev/nvidia\${minor}" ]]; then
+    printf '%s\n' "/dev/nvidia\${minor}"
+  fi
+}
 
 log() {
   logger -t qemu-single-gpu-prepare -- "\$*"
@@ -2920,6 +3002,11 @@ log() {
 fail() {
   log "ERROR: \$*"
   exit 1
+}
+
+state_file_for() {
+  local suffix="\$1"
+  printf '%s/%s.%s\n' "\${STATE_DIR}" "\${GPU_VIDEO_NODE}" "\${suffix}"
 }
 
 user_uid() {
@@ -2932,38 +3019,84 @@ user_bus_ready() {
   [[ -n "\${uid}" ]] && [[ -S "/run/user/\${uid}/bus" ]]
 }
 
-# Smart discovery of the active display manager
 get_active_display_manager() {
   local dm
-  dm=$(systemctl list-units --type=service --state=running | grep -E "gdm|sddm|lightdm|lxdm|ly|greetd" | awk '{print $1}' | head -n1)
-  echo "${dm:-display-manager.service}"
+  dm=\$(systemctl list-units --type=service --state=running | grep -E "gdm|sddm|lightdm|lxdm|ly|greetd" | awk '{print \$1}' | head -n1)
+  echo "\${dm:-display-manager.service}"
 }
 
 stop_system_units() {
-  local dm=$(get_active_display_manager)
-  log "Stopping display manager: ${dm}"
-  systemctl stop "${dm}" 2>/dev/null || true
+  local dm
+  dm="\$(get_active_display_manager)"
+  log "Stopping display manager: \${dm}"
+  systemctl stop "\${dm}" 2>/dev/null || true
   systemctl stop nvidia-persistenced.service nvidia-powerd.service 2>/dev/null || true
 }
 
-# ... (inside nuke_gpu_users)
-nuke_gpu_users() {
-  local pids
-  local count=0
-  mkdir -p /run/passthrough
-  pids=$(gpu_user_pids)
-  if [[ -n "${pids}" ]]; then
-    ps -p "${pids}" -o comm= > /run/passthrough/killed_names.txt
-    log "Recording GPU users: $(tr '\n' ' ' < /run/passthrough/killed_names.txt)"
+stop_user_units() {
+  local uid unit
+  uid="\$(user_uid)"
+  [[ -n "\${uid}" ]] || return 0
+
+  if user_bus_ready; then
+    for unit in "\${USER_UNITS_TO_STOP[@]}"; do
+      runuser -u "\${SESSION_USER}" -- env \
+        XDG_RUNTIME_DIR="/run/user/\${uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/\${uid}/bus" \
+        systemctl --user stop "\${unit}" 2>/dev/null || true
+    done
   fi
-  
+}
+
+kill_user_processes() {
+  local proc
+  for proc in "\${USER_PROCESSES_TO_KILL[@]}"; do
+    pkill -u "\${SESSION_USER}" -TERM -x "\${proc}" 2>/dev/null || true
+  done
+  sleep 1
+  for proc in "\${USER_PROCESSES_TO_KILL[@]}"; do
+    pkill -u "\${SESSION_USER}" -KILL -x "\${proc}" 2>/dev/null || true
+  done
+}
+
+gpu_user_pids() {
+  local -a devices=()
+  local pid
+  mapfile -t devices < <(gpu_device_paths)
+  [[ "\${#devices[@]}" -gt 0 ]] || return 0
+  for pid in \$(fuser "\${devices[@]}" 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u); do
+    [[ "\${pid}" =~ ^[0-9]+$ ]] || continue
+    if ps -o user= -p "\${pid}" 2>/dev/null | awk '{print \$1}' | grep -qx "\${SESSION_USER}"; then
+      printf '%s\n' "\${pid}"
+    fi
+  done
+}
+
+report_gpu_users() {
+  local pid user comm
+  for pid in \$(gpu_user_pids); do
+    user="\$(ps -o user= -p "\${pid}" 2>/dev/null | awk '{print \$1}' || true)"
+    comm="\$(ps -o comm= -p "\${pid}" 2>/dev/null | sed 's/^[[:space:]]*//' || true)"
+    log "GPU user pid=\${pid} user=\${user:-unknown} cmd=\${comm:-unknown}"
+  done
+}
+
+nuke_gpu_users() {
+  local pids pid_csv count=0
+  mkdir -p "\${STATE_DIR}"
+  pids="\$(gpu_user_pids)"
+  if [[ -n "\${pids}" ]]; then
+    pid_csv="\$(printf '%s\n' "\${pids}" | paste -sd, -)"
+    ps -p "\${pid_csv}" -o comm= > "\$(state_file_for killed_names)"
+    log "Recording GPU users: \$(tr '\n' ' ' < "\$(state_file_for killed_names)")"
+  fi
+
   while (( count < 5 )); do
-    pids=$(gpu_user_pids)
-    if [[ -z "${pids}" ]]; then
-      fuser -k -9 /dev/nvidia* /dev/dri/* 2>/dev/null || true
+    pids="\$(gpu_user_pids)"
+    if [[ -z "\${pids}" ]]; then
       return 0
     fi
-    echo "${pids}" | xargs -r kill -9 2>/dev/null || true
+    echo "\${pids}" | xargs -r kill -9 2>/dev/null || true
     sleep 1
     ((count++))
   done
@@ -2982,28 +3115,95 @@ wait_for_module_gone() {
   return 1
 }
 
-unload_gpu_drivers() {
-  local module
-  modprobe -r "\${GPU_DRIVERS_TO_UNLOAD[@]}" 2>/dev/null || true
-  for module in "\${GPU_DRIVERS_TO_UNLOAD[@]}"; do
-    if lsmod | grep -q "^\${module}"; then
-      modprobe -r "\${module}" 2>/dev/null || true
-      wait_for_module_gone "\${module}" || true
-    fi
-  done
-}
-
 driver_in_use() {
   local pci="\$1"
   lspci -nnk -s "\${pci}" | awk -F': ' '/Kernel driver in use/ {print \$2; exit}'
 }
+
+already_detached_to_vfio() {
+  [[ "\$(driver_in_use "\${GPU_PCI}")" == "vfio-pci" ]] && [[ "\$(driver_in_use "\${GPU_AUDIO_PCI}")" == "vfio-pci" ]]
+}
+
+unload_modules_for_driver() {
+  case "\$1" in
+    nvidia)
+      printf '%s\n' nvidia_drm nvidia_modeset nvidia_uvm nvidia
+      ;;
+    amdgpu|radeon|nouveau|xe|i915)
+      printf '%s\n' "\$1"
+      ;;
+  esac
+}
+
+reload_modules_for_driver() {
+  case "\$1" in
+    nvidia)
+      printf '%s\n' nvidia nvidia_modeset nvidia_uvm nvidia_drm
+      ;;
+    amdgpu|radeon|nouveau|xe|i915)
+      printf '%s\n' "\$1"
+      ;;
+  esac
+}
+
+save_release_state() {
+  local driver
+  driver="\$(driver_in_use "\${GPU_PCI}")"
+  mkdir -p "\${STATE_DIR}"
+  printf '%s\n' "\${driver}" > "\$(state_file_for driver)"
+  reload_modules_for_driver "\${driver}" > "\$(state_file_for modules)" || true
+  printf '%s\n' "\$(get_active_display_manager)" > "\$(state_file_for display-manager)"
+}
+
+unload_gpu_drivers() {
+  local driver module
+  local -a modules=()
+  driver="\$(driver_in_use "\${GPU_PCI}")"
+  mapfile -t modules < <(unload_modules_for_driver "\${driver}")
+  [[ "\${#modules[@]}" -gt 0 ]] || return 0
+  log "Unloading selected GPU driver stack for \${GPU_PCI}: \${modules[*]}"
+  modprobe -r "\${modules[@]}" 2>/dev/null || true
+  for module in "\${modules[@]}"; do
+    if lsmod | grep -q "^\${module}"; then
+      modprobe -r "\${module}" 2>/dev/null || true
+      wait_for_module_gone "\${module}" || fail "\${module} is still loaded after attempted unload"
+    fi
+  done
+}
+
+reattach_to_host_and_fail() {
+  virsh nodedev-reattach "\${GPU_AUDIO_NODE}" >/dev/null 2>&1 || true
+  virsh nodedev-reattach "\${GPU_VIDEO_NODE}" >/dev/null 2>&1 || true
+  fail "\$*"
+}
+
+wait_for_vfio_bind() {
+  local deadline=\$((SECONDS + WAIT_SECONDS))
+  while (( SECONDS < deadline )); do
+    if [[ "\$(driver_in_use "\${GPU_PCI}")" == "vfio-pci" ]] && [[ "\$(driver_in_use "\${GPU_AUDIO_PCI}")" == "vfio-pci" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+log "Starting single-GPU prepare hook for \${GPU_PCI}"
+
+if already_detached_to_vfio; then
+  log "GPU is already bound to vfio-pci"
+  exit 0
+fi
 
 stop_system_units
 stop_user_units
 kill_user_processes
 sleep 1
 
-nuke_gpu_users || log "Warning: Could not kill all processes using the GPU"
+nuke_gpu_users || {
+  report_gpu_users
+  fail "Selected GPU device nodes are still busy; refusing to unload the GPU driver"
+}
 
 for vt in /sys/class/vtconsole/vtcon*; do
   [[ -w "\${vt}/bind" ]] || continue
@@ -3014,6 +3214,7 @@ if [[ -e /sys/bus/platform/drivers/efi-framebuffer/unbind ]]; then
   echo efi-framebuffer.0 > /sys/bus/platform/drivers/efi-framebuffer/unbind || true
 fi
 
+save_release_state
 unload_gpu_drivers
 
 modprobe vfio
@@ -3023,8 +3224,8 @@ modprobe vfio_iommu_type1
 virsh nodedev-detach "\${GPU_AUDIO_NODE}" || true
 virsh nodedev-detach "\${GPU_VIDEO_NODE}" || true
 
-[[ "\$(driver_in_use "\${GPU_PCI}")" == "vfio-pci" ]] || fail "GPU video function did not bind to vfio-pci"
-[[ "\$(driver_in_use "\${GPU_AUDIO_PCI}")" == "vfio-pci" ]] || fail "GPU audio function did not bind to vfio-pci"
+command -v udevadm >/dev/null 2>&1 && udevadm settle || true
+wait_for_vfio_bind || reattach_to_host_and_fail "GPU functions did not bind to vfio-pci"
 EOF
 )
 
@@ -3034,26 +3235,47 @@ set -euo pipefail
 
 GPU_VIDEO_NODE="${video_node}"
 GPU_AUDIO_NODE="${audio_node}"
-GPU_DRIVERS_TO_RELOAD=(
-  xe
-  i915
-  nvidia
-  nvidia_modeset
-  nvidia_uvm
-  nvidia_drm
-  amdgpu
-  radeon
-  nouveau
-)
+STATE_DIR="/run/passthrough"
 
 log() {
   logger -t qemu-single-gpu-release -- "\$*"
   echo "[qemu-single-gpu-release] \$*" >&2
 }
 
+state_file_for() {
+  local suffix="\$1"
+  printf '%s/%s.%s\n' "\${STATE_DIR}" "\${GPU_VIDEO_NODE}" "\${suffix}"
+}
+
+reload_modules_for_driver() {
+  case "\$1" in
+    nvidia)
+      printf '%s\n' nvidia nvidia_modeset nvidia_uvm nvidia_drm
+      ;;
+    amdgpu|radeon|nouveau|xe|i915)
+      printf '%s\n' "\$1"
+      ;;
+  esac
+}
+
 reload_gpu_drivers() {
   local module
-  for module in "\${GPU_DRIVERS_TO_RELOAD[@]}"; do
+  local -a modules=()
+
+  if [[ -f "\$(state_file_for modules)" ]]; then
+    mapfile -t modules < "\$(state_file_for modules)"
+  fi
+
+  if [[ "\${#modules[@]}" -eq 0 ]] && [[ -f "\$(state_file_for driver)" ]]; then
+    mapfile -t modules < <(reload_modules_for_driver "\$(cat "\$(state_file_for driver)")")
+  fi
+
+  if [[ "\${#modules[@]}" -eq 0 ]]; then
+    modules=(nvidia nvidia_modeset nvidia_uvm nvidia_drm amdgpu radeon nouveau xe i915)
+  fi
+
+  log "Reloading host GPU driver stack: \${modules[*]}"
+  for module in "\${modules[@]}"; do
     modprobe "\${module}" || true
   done
 }
@@ -3080,7 +3302,12 @@ systemctl start nvidia-persistenced.service 2>/dev/null || true
 systemctl start nvidia-powerd.service 2>/dev/null || true
 
 log "Restarting display manager..."
-systemctl restart display-manager.service 2>/dev/null || systemctl start display-manager.service 2>/dev/null || true
+if [[ -f "\$(state_file_for display-manager)" ]]; then
+  dm_unit="\$(cat "\$(state_file_for display-manager)")"
+else
+  dm_unit="display-manager.service"
+fi
+systemctl restart "\${dm_unit}" 2>/dev/null || systemctl start "\${dm_unit}" 2>/dev/null || true
 EOF
 )
 
@@ -3343,33 +3570,41 @@ main() {
 
   ui_section "VM Configuration"
   case "$(prompt_menu_choice "Choose passthrough mode" "1" \
-    "Single-GPU passthrough [single]" \
-    "Dual-GPU passthrough [double]")" in
+    "Single-GPU — host shares GPU, VM temporarily takes it [single]" \
+    "Dedicated — GPU permanently passed through, host uses other GPU [double]")" in
     *"[single]") mode="single" ;;
     *"[double]") mode="double" ;;
     *) fail "Unexpected passthrough mode selection." ;;
   esac
 
+  if [[ "${mode}" == "single" ]]; then
+    warn "Single-GPU mode will tear down the host graphical session when the VM starts."
+    warn "Browsers, Electron apps, game launchers, containers, and anything using the selected GPU may be stopped or killed."
+    warn "If you have an iGPU or another host GPU available, dedicated mode is the safer default."
+  fi
+
   user_name="$(prompt "Host username that should be added to libvirt" "${SUDO_USER:-${USER}}")"
   vm_name="$(prompt "Libvirt VM name for hook wiring" "windows")"
   cleanup_existing_passthrough_vms "${vm_name}"
   existing_disk_path="/var/lib/libvirt/images/${vm_name}.qcow2"
-  windows_version="$(prompt_windows_version "${windows_version}")"
-  windows_language="$(prompt_windows_language "${windows_language}")"
-  windows_password="$(prompt_secret "Windows VM password" "${windows_password}")"
-  if confirm "Enable Windows test mode and relaxed driver signature enforcement?" "n"; then
-    windows_test_mode="1"
-  fi
-  if confirm "Use the full Winhance+virtio install profile instead of standard+virtio?" "n"; then
-    winhance_payload="1"
-    install_profile="winhance"
+  if [[ -f "${existing_disk_path}" ]]; then
+    ui_note "Existing VM disk detected and will be reused: ${existing_disk_path}"
+    ui_note "Skipping Windows version/language prompts (existing disk will be reused)"
+  else
+    windows_version="$(prompt_windows_version "${windows_version}")"
+    windows_language="$(prompt_windows_language "${windows_language}")"
+    windows_password="$(prompt_secret "Windows VM password" "${windows_password}")"
+    if confirm "Enable Windows test mode and relaxed driver signature enforcement?" "n"; then
+      windows_test_mode="1"
+    fi
+    if confirm "Use the full Winhance+virtio install profile instead of standard+virtio?" "n"; then
+      winhance_payload="1"
+      install_profile="winhance"
+    fi
   fi
   vcpus="$(prompt_number "VM vCPU count" "8" "1")"
   memory_mb="$(prompt_number "VM memory in MB" "16384" "1024")"
   disk_size_gb="$(prompt_number "VM disk size in GB" "120" "32")"
-  if [[ -f "${existing_disk_path}" ]]; then
-    ui_note "Existing VM disk detected and will be reused: ${existing_disk_path}"
-  fi
   check_disk_space "/var/lib/libvirt/images" "${disk_size_gb}" "${existing_disk_path}"
   usb_controller_entries="$(list_usb_controllers || true)"
   isolated_usb_entries="$(isolated_usb_controllers "${usb_controller_entries}" || true)"
@@ -3399,22 +3634,36 @@ main() {
   else
     warn "No separate USB controllers detected. USB passthrough wizard skipped."
   fi
-  windows_iso="$(choose_windows_iso "${windows_iso}" "${windows_version}" "${windows_language}")"
-  virtio_iso="$(prompt_iso_path "virtio ISO path" "${virtio_iso}" "${VIRTIO_ISO_URL}")"
+  if [[ -f "${existing_disk_path}" ]]; then
+    ui_note "Skipping Windows/virtio ISO prompts (existing disk will be reused)"
+  else
+    windows_iso="$(choose_windows_iso "${windows_iso}" "${windows_version}" "${windows_language}")"
+    virtio_iso="$(prompt_iso_path "virtio ISO path" "${virtio_iso}" "${VIRTIO_ISO_URL}")"
+  fi
   vfio_ids="$(device_ids_for_bus "${gpu_pci}")"
   [[ -n "${vfio_ids}" ]] || fail "Could not derive PCI IDs for ${gpu_pci}"
 
   ui_section "Plan Review"
-  ui_kv "Mode" "${mode}-GPU passthrough"
+  if [[ "${mode}" == "single" ]]; then
+    ui_kv "Mode" "single-GPU (host shares GPU)"
+  else
+    ui_kv "Mode" "dedicated (GPU permanently passed through)"
+  fi
   ui_kv "GPU bus" "${gpu_pci%.*}"
   ui_kv "VFIO IDs" "${vfio_ids}"
   ui_kv "User" "${user_name}"
   ui_kv "VM name" "${vm_name}"
-  ui_kv "Windows version" "${windows_version}"
-  ui_kv "Windows language" "${windows_language}"
-  ui_kv "Windows password" "[hidden]"
-  ui_kv "Windows test mode" "$([[ "${windows_test_mode}" == "1" ]] && printf 'enabled' || printf 'disabled')"
-  ui_kv "Install profile" "${install_profile}+virtio"
+  if [[ -f "${existing_disk_path}" ]]; then
+    ui_kv "Existing disk" "${existing_disk_path}"
+  else
+    ui_kv "Windows version" "${windows_version}"
+    ui_kv "Windows language" "${windows_language}"
+    ui_kv "Windows password" "[hidden]"
+    ui_kv "Windows test mode" "$([[ "${windows_test_mode}" == "1" ]] && printf 'enabled' || printf 'disabled')"
+    ui_kv "Install profile" "${install_profile}+virtio"
+    ui_kv "Windows ISO" "${windows_iso:-unset}"
+    ui_kv "virtio ISO" "${virtio_iso:-unset}"
+  fi
   ui_kv "vCPUs" "${vcpus}"
   ui_kv "Memory" "${memory_mb} MB"
   ui_kv "Disk" "${disk_size_gb} GB"
@@ -3425,8 +3674,6 @@ main() {
   if [[ -n "${usb_device_ids}" ]]; then
     ui_kv "USB devices" "$(printf '%s' "${usb_device_ids}" | paste -sd',' -)"
   fi
-  ui_kv "Windows ISO" "${windows_iso:-unset}"
-  ui_kv "virtio ISO" "${virtio_iso:-unset}"
   ui_kv "Backups" "${BACKUP_DIR}"
 
   confirm "Proceed with these changes?" "y" || exit 0
@@ -3439,7 +3686,7 @@ main() {
   write_state_file "${mode}" "${user_name}" "${vm_name}" "${gpu_pci}" "${gpu_audio_pci}" "${vfio_ids}" "${bootloader}" "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" "${windows_iso}" "${vcpus}" "${memory_mb}" "${disk_size_gb}" "${windows_version}" "${windows_language}" "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" "${windows_test_mode}" "${winhance_payload}" "${install_profile}" "${windows_password}" "host-configured"
   create_status_script
   create_postboot_service
-  create_vm_helper_scripts "${vm_name}" "${gpu_pci}" "${gpu_audio_pci}" "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" "${windows_test_mode}" "${winhance_payload}" "${windows_password}"
+  create_vm_helper_scripts "${vm_name}" "${gpu_pci}" "${gpu_audio_pci}" "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" "${windows_test_mode}" "${winhance_payload}" "${windows_password}" "${existing_disk_path}"
 
   if [[ "${mode}" == "single" ]]; then
     create_single_gpu_hooks "${vm_name}" "${user_name}" "${gpu_pci}" "${gpu_audio_pci}"

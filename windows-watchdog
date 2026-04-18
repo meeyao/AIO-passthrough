@@ -11,22 +11,38 @@ source "${STATE_FILE}"
 VM_NAME="${VM_NAME:-windows}"
 GPU_PCI="${GPU_PCI:-}"
 
-# Function to check if the VM is actually running
-is_vm_running() {
-  [[ "$(virsh -c qemu:///system domstate "${VM_NAME}" 2>/dev/null || true)" == "running" ]]
+virsh_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 5s virsh -c qemu:///system "$@" 2>/dev/null
+  else
+    virsh -c qemu:///system "$@" 2>/dev/null
+  fi
 }
 
-# Function to check if GPU is bound to vfio-pci
+is_vm_running() {
+  [[ "$(virsh_timeout domstate "${VM_NAME}" || true)" == "running" ]]
+}
+
 is_gpu_in_vfio() {
   [[ -n "${GPU_PCI}" ]] && lspci -nnk -s "${GPU_PCI}" | grep -q "vfio-pci"
+}
+
+gpu_driver_missing() {
+  [[ -n "${GPU_PCI}" ]] && ! lspci -nnk -s "${GPU_PCI}" | grep -q "Kernel driver in use:"
 }
 
 echo "Starting windows-watchdog for ${VM_NAME}..."
 
 while true; do
-  if ! is_vm_running; then
-    if is_gpu_in_vfio; then
-      echo "[$(date)] VM ${VM_NAME} is down but GPU is still in VFIO mode. Triggering reset-host..."
+  vm_state="$(virsh_timeout domstate "${VM_NAME}" || true)"
+  if [[ -z "${vm_state}" ]]; then
+    if is_gpu_in_vfio || gpu_driver_missing; then
+      echo "[$(date)] virsh domstate timed out or failed while the GPU is detached. Triggering reset-host..."
+      /usr/local/bin/passthrough-reset-host
+    fi
+  elif [[ "${vm_state}" != "running" ]]; then
+    if is_gpu_in_vfio || gpu_driver_missing; then
+      echo "[$(date)] VM ${VM_NAME} state is '${vm_state}' while the GPU is detached. Triggering reset-host..."
       /usr/local/bin/passthrough-reset-host
     fi
   fi

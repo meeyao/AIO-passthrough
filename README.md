@@ -68,9 +68,11 @@ During setup, you choose one of these:
 - A Spice viewer should open automatically during the install phase.
 - If it does not, open the VM with `virt-manager` or `virt-viewer`.
 - In `single` GPU mode, switching to real passthrough will stop the display manager, tear down the host graphical session, unload GPU drivers, and detach the GPU from Linux.
+- The setup script now warns aggressively before `single` GPU mode proceeds, because that handoff is disruptive by design.
 - Browsers, Electron apps, compositors, and anything actively using `/dev/dri/*` or `/dev/nvidia*` may be killed during that handoff.
 - CPU-only services usually survive. GPU-using containers may not.
 - When the passthrough VM shuts down, the release hook should reattach the GPU to Linux and restart the display manager automatically.
+- If you point setup at ISOs in a user-owned path like `~/Downloads`, it will try to grant libvirt the minimum directory traversal access needed to read them.
 
 ## Fresh Installs
 
