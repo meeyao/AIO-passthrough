@@ -196,9 +196,9 @@ main() {
   fi
 
   local vcpus memory_mb disk_size_gb
-  vcpus="$(prompt_number "VM vCPU count" "8" "1")"
-  memory_mb="$(prompt_number "VM memory in MB" "16384" "1024")"
-  disk_size_gb="$(prompt_number "VM disk size in GB" "120" "32")"
+  vcpus="$(prompt_number "VM vCPU count" "4" "1")"
+  memory_mb="$(prompt_number "VM memory in MB" "4096" "1024")"
+  disk_size_gb="$(prompt_number "VM disk size in GB" "32" "32")"
   check_disk_space "/var/lib/libvirt/images" "${disk_size_gb}" "${existing_disk_path}"
 
   # ─── USB passthrough ──────────────────────────────────────────────────────
@@ -211,8 +211,8 @@ main() {
   if [[ -n "${usb_controller_entries}" ]]; then
     if [[ -z "${isolated_usb_entries}" ]]; then
       warn "No USB controllers are in an isolated IOMMU group. Controller passthrough is unsafe."
-      warn "Falling back to per-device USB passthrough or none."
-      usb_mode="$(prompt_usb_mode "devices")"
+      warn "Falling back to per-device USB passthrough, evdev, or none."
+      usb_mode="$(prompt_usb_mode "evdev")"
     else
       usb_mode="$(prompt_usb_mode "controller")"
     fi
@@ -235,6 +235,7 @@ main() {
     esac
   else
     warn "No separate USB controllers detected. USB passthrough wizard skipped."
+    usb_mode="$(prompt_usb_mode "evdev")"
   fi
 
   # ─── ISO selection ────────────────────────────────────────────────────────
@@ -242,7 +243,7 @@ main() {
     ui_note "Skipping Windows/virtio ISO prompts (existing disk will be reused)."
   else
     windows_iso="$(choose_windows_iso "${windows_iso}" "${windows_version}" "${windows_language}")"
-    virtio_iso="$(prompt_iso_path "virtio ISO path" "${virtio_iso}" "${VIRTIO_ISO_URL}")"
+    virtio_iso="$(choose_virtio_iso "${virtio_iso}")"
   fi
 
   vfio_ids="$(device_ids_for_bus "${gpu_pci}")"

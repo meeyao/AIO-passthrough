@@ -397,6 +397,97 @@ download_windows_iso() {
 # ---------------------------------------------------------------------------
 # ISO prompt / strategy helpers
 # ---------------------------------------------------------------------------
+download_virtio_iso() {
+  local output_path="$1"
+  local iso_url="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.285-1/virtio-win-0.1.285.iso"
+  local tmp_output
+  local -a curl_download_cmd
+
+  need_download_cmds curl
+  log "Resolved Virtio ISO URL: ${iso_url}"
+
+  ensure_dir "$(dirname "${output_path}")"
+  tmp_output="$(mktemp "${output_path}.tmp.XXXXXX")"
+  curl_download_cmd=(curl -L --fail --output "${tmp_output}")
+  if [[ -t 1 ]]; then
+    curl_download_cmd+=(--progress-bar)
+  fi
+  curl_download_cmd+=("${iso_url}")
+  if run "${curl_download_cmd[@]}" && validate_iso_file "${tmp_output}" "Virtio ISO" 104857600; then
+    mv -f "${tmp_output}" "${output_path}"
+    return 0
+  fi
+  rm -f "${tmp_output}"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# ISO prompt / strategy helpers
+# ---------------------------------------------------------------------------
+prompt_virtio_iso_strategy() {
+  local detected="${1:-}"
+  local answer
+
+  while :; do
+    ui_section "Virtio Media" >&2
+    if [[ -n "${detected}" && -f "${detected}" ]]; then
+      ui_note "Detected local Virtio ISO: ${detected}" >&2
+      ui_note "Choose how you want to continue:" >&2
+      answer="$(prompt_menu_choice "Virtio ISO option" "1" \
+        "Use detected ISO" \
+        "Enter a different ISO path" \
+        "Download Virtio ISO automatically")"
+      case "${answer}" in
+        "Use detected ISO") printf 'detected\n'; return 0 ;;
+        "Enter a different ISO path") printf 'manual\n'; return 0 ;;
+        "Download Virtio ISO automatically") printf 'download\n'; return 0 ;;
+      esac
+    else
+      ui_note "No local Virtio ISO was detected." >&2
+      ui_note "Choose how you want to continue:" >&2
+      answer="$(prompt_menu_choice "Virtio ISO option" "1" \
+        "Enter a Virtio ISO path" \
+        "Download Virtio ISO automatically")"
+      case "${answer}" in
+        "Enter a Virtio ISO path") printf 'manual\n'; return 0 ;;
+        "Download Virtio ISO automatically") printf 'download\n'; return 0 ;;
+      esac
+    fi
+    warn "Choose one of the listed Virtio ISO options."
+  done
+}
+
+choose_virtio_iso() {
+  local detected="${1:-}"
+  local strategy answer
+
+  strategy="$(prompt_virtio_iso_strategy "${detected}")"
+  case "${strategy}" in
+    detected)
+      printf '%s\n' "${detected}"
+      return 0
+      ;;
+    manual)
+      prompt_iso_path "Virtio ISO path" "" "${VIRTIO_ISO_URL}" "0"
+      return 0
+      ;;
+    download)
+      answer="/var/lib/libvirt/images/virtio-win.iso"
+      ui_note "Automatic download target: ${answer}" >&2
+      if download_virtio_iso "${answer}" >&2; then
+        printf '%s\n' "${answer}"
+        return 0
+      fi
+      warn "Automatic Virtio ISO download failed."
+      ui_note "Official download page: ${VIRTIO_ISO_URL}" >&2
+      prompt_iso_path "Virtio ISO path" "" "${VIRTIO_ISO_URL}" "0"
+      return 0
+      ;;
+  esac
+
+  fail "Could not determine how to obtain the Virtio ISO."
+}
+
 prompt_windows_iso_strategy() {
   local detected="${1:-}"
   local answer

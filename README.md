@@ -189,6 +189,28 @@ Prints every file write and command that would be executed without touching the 
 
 ---
 
+## Verified Configurations
+
+The following hardware and software combinations have been tested and are confirmed **stable**:
+
+### Desktop Enthusiast (Stable Build)
+- **OS**: CachyOS (Arch-based)
+- **Kernel**: 6.18.22-1-cachyos-lts
+- **GPU**: NVIDIA RTX 3070 (GA104)
+- **CPU**: AMD Ryzen
+- **VM Configuration**:
+  - **Memory**: 4096 MB (Stable minimum)
+  - **vCPUs**: 4 (Stable default)
+  - **Disk**: 32 GB (Thin provisioned)
+  - **USB**: `evdev` (Highly stable for keyboard/mouse)
+  - **Windows**: 11 Pro (24H2)
+  - **Profiles**: Winhance + Virtio + Test Mode (DSE Off)
+
+> [!TIP]
+> If you encounter black screens or boot loops during the Spice installation phase, try backing down to **4 vCPUs** and **4096 MB RAM** temporarily. You can always increase these values in the XML after the Windows install is complete.
+
+---
+
 ## Troubleshooting
 
 **Post-boot validation:**
