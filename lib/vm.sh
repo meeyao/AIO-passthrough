@@ -802,6 +802,12 @@ for name, state in (
     ("tlbflush", "off"), ("ipi", "off"), ("avic", "on"),
 ):
     ET.SubElement(hyperv, name, {"state": state})
+# CONCEALMENT: Spoof hypervisor vendor_id to prevent CPUID 0x40000000 KVM signature
+# Use a random 12-char alphanumeric string (bare-metal CPUs don't have hypervisor vendor)
+# Ref: single-gpu-passthrough.wiki FAQ "I want to hide my KVM from anti-cheats"
+import os as _os, hashlib as _hl
+_seed = _hl.md5((_os.uname().nodename + xml_path).encode()).hexdigest()[:12]
+ET.SubElement(hyperv, "vendor_id", {"state": "on", "value": _seed})
 # CONCEALMENT: Hide KVM hypervisor from CPUID-based discovery
 kvm_el = ET.SubElement(features, "kvm")
 ET.SubElement(kvm_el, "hidden", {"state": "on"})
@@ -834,6 +840,11 @@ ET.SubElement(cpu, "feature", {"policy": "disable", "name": "hypervisor"})
 ET.SubElement(cpu, "feature", {"policy": "disable", "name": "ssbd"})
 ET.SubElement(cpu, "feature", {"policy": "disable", "name": "amd-ssbd"})
 ET.SubElement(cpu, "feature", {"policy": "disable", "name": "virt-ssbd"})
+# COMPAT: Enable topoext on AMD so hyperthreading topology is exposed correctly
+# Ref: single-gpu-passthrough.wiki "9) Additional editing of xml file"
+import os as _os2
+if _os2.environ.get("CPU_VENDOR", "").lower() == "amd":
+    ET.SubElement(cpu, "feature", {"policy": "require", "name": "topoext"})
 insert_after = root.find("features")
 insert_idx = list(root).index(insert_after) + 1 if insert_after is not None else 3
 root.insert(insert_idx, cpu)
@@ -851,6 +862,16 @@ insert_after = root.find("cpu")
 insert_idx = list(root).index(insert_after) + 1 if insert_after is not None else 4
 root.insert(insert_idx, clock)
 
+# CONCEALMENT: Inject host SMBIOS data (serial numbers, board info) into the os block.
+# EAC reads SMBIOS serials via WMI; real host values make the VM indistinguishable.
+# Ref: single-gpu-passthrough.wiki FAQ: "adding <smbios mode='host'/> to the <os> section"
+os_el = root.find("os")
+if os_el is not None:
+    existing_smbios = os_el.find("smbios")
+    if existing_smbios is None:
+        ET.SubElement(os_el, "smbios", {"mode": "host"})
+
+
 # PERFORMANCE: Disable virtio memballoon — kills GPU passthrough perf
 if devices is not None:
     for child in list(devices):
@@ -863,6 +884,9 @@ if devices is not None:
 
 tree.write(xml_path, encoding="unicode")
 PY
+
+# Pass CPU_VENDOR into the Python script via environment so topoext logic works
+export CPU_VENDOR="${CPU_VENDOR:-}"
 
 virsh -c "\${URI}" define "\${xml_after}" >/dev/null
 virsh -c "\${URI}" attach-device "\${VM_NAME}" /etc/passthrough/\${VM_NAME}-gpu-video.xml --config
