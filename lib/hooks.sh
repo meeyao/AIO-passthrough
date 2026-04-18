@@ -44,6 +44,10 @@ USER_PROCESSES_TO_KILL=(
   niri
   quickshell
   qs
+  # KDE powerdevil silently holds the GPU I2C bus, blocking nvidia_drm unload
+  # even when lsof /dev/nvidia* shows nothing. Kill it first.
+  # (technique from VFIO-Nvidia-dynamic-unbind/scripts/detachgpu.sh)
+  org_kde_powerdevil
 )
 
 nvidia_device_minor_for_pci() {
@@ -109,6 +113,23 @@ stop_system_units() {
   log "Stopping display manager: \${dm}"
   systemctl stop "\${dm}" 2>/dev/null || true
   systemctl stop nvidia-persistenced.service nvidia-powerd.service 2>/dev/null || true
+}
+
+# Signal KWin / DRM compositors to gracefully release the GPU card node before
+# we yank the driver. This avoids a full DE restart on KDE Wayland in many cases.
+# Technique from VFIO-Nvidia-dynamic-unbind/scripts/detachgpu.sh:
+#   udevadm trigger --action=remove /dev/dri/card1
+# which maps to kwin drm_backend.cpp:L190 hot-remove path.
+udevadm_signal_drm_remove() {
+  local sysfs_base="/sys/bus/pci/devices/\${GPU_PCI}/drm"
+  local card
+  [[ -d "\${sysfs_base}" ]] || return 0
+  for card in "\${sysfs_base}"/card*; do
+    [[ -d "\${card}" ]] || continue
+    log "Sending udev remove event to DRM card: \${card}"
+    udevadm trigger --action=remove "\${card}" 2>/dev/null || true
+  done
+  sleep 1
 }
 
 stop_user_units() {
@@ -272,6 +293,10 @@ if already_detached_to_vfio; then
   log "GPU is already bound to vfio-pci"
   exit 0
 fi
+
+# Fire udev remove event first so KWin can gracefully release the DRM node.
+# On KDE Wayland this may avoid the need for a full display manager restart.
+udevadm_signal_drm_remove
 
 stop_system_units
 stop_user_units
