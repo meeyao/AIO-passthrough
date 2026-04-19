@@ -368,6 +368,10 @@ main() {
   configure_modprobe "${mode}" "${vfio_ids}" "${cpu_vendor}"
   configure_libvirt "${user_name}"
 
+  if [[ "${looking_glass}" == "1" ]]; then
+    configure_kvmfr "32"
+  fi
+
   write_state_file \
     "${mode}" "${user_name}" "${vm_name}" \
     "${gpu_pci}" "${gpu_audio_pci}" "${vfio_ids}" "${bootloader}" \

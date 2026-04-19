@@ -144,3 +144,18 @@ configure_modprobe() {
     fi
   fi
 }
+
+configure_kvmfr() {
+  local size_mb="${1:-32}"
+  local mod_file="/etc/modprobe.d/kvmfr.conf"
+  local load_file="/etc/modules-load.d/kvmfr.conf"
+  local udev_file="/etc/udev/rules.d/99-kvmfr.rules"
+
+  ui_note "Configuring KVMFR module (static_size_mb=${size_mb})..."
+
+  write_file "${mod_file}" "options kvmfr static_size_mb=${size_mb}"
+  write_file "${load_file}" "kvmfr"
+  write_file "${udev_file}" 'SUBSYSTEM=="kvmfr", OWNER="root", GROUP="libvirt", MODE="0660"'
+
+  ui_note "KVMFR module configuration written. It will be active after next reboot."
+}
