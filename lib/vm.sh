@@ -16,7 +16,8 @@ create_vm_helper_scripts() {
   local winhance_payload="${11}"
   local windows_password="${12}"
   local sunshine_payload="${13:-0}"
-  local existing_disk="${14:-}"
+  local looking_glass="${14:-0}"
+  local existing_disk="${15:-}"
 
   local create_body attach_body video_xml audio_xml unattend_xml setupcomplete_body
   local build_unattend_body build_windows_body set_stage_body controller_xml usb_attach_block
@@ -419,6 +420,25 @@ EOF
     setupcomplete_body+=$'  echo [%date% %time%] VB-Cable installed.>>\"%%PT_SETUP_LOG%%\"\r\n'
     setupcomplete_body+=$')\r\n'
   fi
+
+  if [[ "${looking_glass}" == "1" ]]; then
+    setupcomplete_body+=$'echo [%date% %time%] Installing Looking Glass Host...>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$url = (Invoke-RestMethod https://api.github.com/repos/gnif/LookingGlass/releases/latest).assets | Where-Object { $_.name -like \\\"looking-glass-host-setup.exe\\\" } | Select-Object -ExpandProperty browser_download_url; Invoke-WebRequest -Uri $url -OutFile $env:TEMP\\\\lg-setup.exe -UseBasicParsing" 2>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$'if exist \"%%TEMP%%\\lg-setup.exe\" (\r\n'
+    setupcomplete_body+=$'  start /wait \"\" \"%%TEMP%%\\lg-setup.exe\" /S 2>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$'  echo [%date% %time%] Looking Glass Host installed.>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$')\r\n'
+
+    setupcomplete_body+=$'echo [%date% %time%] Installing IddSampleDriver (Virtual Display)...>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"Invoke-WebRequest -Uri https://github.com/ge9/IddSampleDriver/releases/download/v0.0.1/IddSampleDriver.zip -OutFile $env:TEMP\\\\Idd.zip -UseBasicParsing; Expand-Archive -Path $env:TEMP\\\\Idd.zip -DestinationPath $env:TEMP\\\\Idd -Force\" 2>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$'if exist \"%%TEMP%%\\Idd\\install.bat\" (\r\n'
+    setupcomplete_body+=$'  pushd \"%%TEMP%%\\Idd\"\r\n'
+    setupcomplete_body+=$'  call install.bat 2>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$'  popd\r\n'
+    setupcomplete_body+=$'  echo [%date% %time%] IddSampleDriver installed.>>\"%%PT_SETUP_LOG%%\"\r\n'
+    setupcomplete_body+=$')\r\n'
+  fi
+
   setupcomplete_body+=$'exit /b 0\r\n'
 
   create_body=$(cat <<EOF
@@ -481,6 +501,10 @@ cmd=(
 # Patched ISO has Autounattend.xml + SetupComplete.cmd embedded inside.
 # OVMF auto-boots from this DVD because the HDD is blank (no EFI partition).
 cmd+=(--disk "path=\${PATCHED_WINDOWS_ISO},device=cdrom")
+
+if [[ "\${LOOKING_GLASS:-0}" == "1" ]]; then
+  cmd+=(--shm "name=looking-glass,size=32")
+fi
 
 if [[ -n "\${VIRTIO_MEDIA}" && -f "\${VIRTIO_MEDIA}" ]]; then
   cmd+=(--disk "path=\${VIRTIO_MEDIA},device=cdrom")
@@ -777,6 +801,8 @@ if devices is not None:
             devices.remove(child)
         elif child.tag == "input" and child.get("type") == "tablet":
             devices.remove(child)
+        elif child.tag == "shm":
+            devices.remove(child)
 
 features = root.find("features")
 if features is not None:
@@ -874,6 +900,10 @@ if devices is not None:
         ET.SubElement(devices, "input", {"type": "mouse", "bus": "usb"})
     if ("keyboard", "usb") not in existing_usb_inputs:
         ET.SubElement(devices, "input", {"type": "keyboard", "bus": "usb"})
+
+    if "${looking_glass}" == "1":
+        shm = ET.SubElement(devices, "shm", {"name": "looking-glass"})
+        ET.SubElement(shm, "size", {"unit": "MiB"}).text = "32"
 
 tree.write(xml_path, encoding="unicode")
 PY

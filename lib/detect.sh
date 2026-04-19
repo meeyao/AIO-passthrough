@@ -154,6 +154,20 @@ detect_igpu() {
   return 1
 }
 
+# Detect if the system is a laptop
+is_laptop() {
+  if [[ -d /sys/class/power_supply/BAT0 ]] || [[ -d /sys/class/power_supply/BAT1 ]]; then
+    return 0
+  fi
+  # Fallback to chassis type check
+  if command -v dmidecode >/dev/null 2>&1; then
+    local chassis
+    chassis=$(run_maybe_sudo dmidecode -s chassis-type 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+    [[ "${chassis}" == "laptop" || "${chassis}" == "notebook" || "${chassis}" == "portable" ]] && return 0
+  fi
+  return 1
+}
+
 detect_gpu_topology() {
   # Returns: single-gpu | igpu+dgpu | multi-dgpu
   local gpu_count igpu

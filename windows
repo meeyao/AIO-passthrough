@@ -13,6 +13,7 @@
 #   ./windows destroy      — force-kill
 #   ./windows reset        — hard reset
 #   ./windows reboot       — guest reboot
+#   ./windows lg           — launch Looking Glass client
 #   ./windows status       — show stage + VM state
 #   ./windows next         — print what the next step is
 #   ./windows xml          — dump libvirt XML
@@ -650,6 +651,17 @@ case "${ACTION}" in
     ;;
   reboot)
     exec virsh -c "${URI}" reboot "${VM_NAME}"
+    ;;
+  lg|looking-glass)
+    if [[ "${LOOKING_GLASS:-0}" != "1" ]]; then
+      echo "Looking Glass is not enabled for this VM. Re-run setup to enable it." >&2
+      exit 1
+    fi
+    if ! command -v looking-glass-client >/dev/null 2>&1; then
+      echo "looking-glass-client not found. Install it first." >&2
+      exit 1
+    fi
+    exec looking-glass-client -p /dev/shm/looking-glass
     ;;
   stream|headless)
     stream_mode

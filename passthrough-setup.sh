@@ -100,7 +100,7 @@ regen_scripts() {
     "${OVMF_CODE}" "${OVMF_VARS}" "${VIRTIO_ISO:-}" \
     "${USB_MODE:-none}" "${USB_CONTROLLER_PCI:-}" "${USB_DEVICE_IDS:-}" \
     "${WINDOWS_TEST_MODE:-0}" "${WINHANCE_PAYLOAD:-0}" "${WINDOWS_PASSWORD:-Passw0rd!}" \
-    "${SUNSHINE_PAYLOAD:-0}" "${existing_disk_path}"
+    "${SUNSHINE_PAYLOAD:-0}" "${LOOKING_GLASS:-0}" "${existing_disk_path}"
 
   if [[ "${MODE}" == "single" ]]; then
     create_single_gpu_hooks "${VM_NAME}" "${SESSION_USER}" "${GPU_PCI}" "${GPU_AUDIO_PCI}"
@@ -253,6 +253,13 @@ main() {
     if confirm "Auto-install Sunshine inside the VM for headless Moonlight streaming?" "n"; then
       sunshine_payload="1"
     fi
+    local lg_default="n"
+    is_laptop && lg_default="y"
+    if confirm "Install Looking Glass (shared-memory display for laptops/headless)?" "${lg_default}"; then
+      looking_glass="1"
+    else
+      looking_glass="0"
+    fi
   fi
 
   local vcpus memory_mb disk_size_gb
@@ -326,6 +333,7 @@ main() {
     ui_kv "Password"       "[hidden]"
     ui_kv "Test mode"      "$([[ "${windows_test_mode}" == "1" ]] && printf 'enabled' || printf 'disabled')"
     ui_kv "Sunshine/VB-Cable" "$([[ "${sunshine_payload}" == "1" ]] && printf 'enabled (installs on first boot)' || printf 'disabled')"
+    ui_kv "Looking Glass"  "$([[ "${looking_glass}" == "1" ]] && printf 'enabled' || printf 'disabled')"
     ui_kv "Install profile" "${install_profile}+virtio"
     ui_kv "Windows ISO"    "${windows_iso:-unset}"
     ui_kv "virtio ISO"     "${virtio_iso:-unset}"
@@ -340,6 +348,15 @@ main() {
   ui_kv "OVMF code"       "${ovmf_code}"
   ui_kv "OVMF vars"       "${ovmf_vars}"
 
+  if is_laptop; then
+    echo
+    ui_warn "Laptop hardware detected!"
+    echo "  - If you do NOT have a Mux Switch: you must use Looking Glass or Sunshine."
+    echo "  - The internal laptop screen will remain black otherwise."
+    echo "  - Many laptop HDMI/DP ports are wired to the iGPU and will also remain black."
+  fi
+
+  echo
   confirm "Proceed with these changes?" "y" || exit 0
 
   # ─── Apply ────────────────────────────────────────────────────────────────
@@ -359,7 +376,7 @@ main() {
     "${windows_version}" "${windows_language}" \
     "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" \
     "${windows_test_mode}" "${winhance_payload}" "${install_profile}" \
-    "${windows_password}" "${sunshine_payload}" "host-configured"
+    "${windows_password}" "${sunshine_payload}" "${looking_glass}" "host-configured"
 
   create_status_script
   create_postboot_service
@@ -368,7 +385,7 @@ main() {
     "${ovmf_code}" "${ovmf_vars}" "${virtio_iso}" \
     "${usb_mode}" "${usb_controller_pci}" "${usb_device_ids}" \
     "${windows_test_mode}" "${winhance_payload}" "${windows_password}" \
-    "${sunshine_payload}" "${existing_disk_path}"
+    "${sunshine_payload}" "${looking_glass}" "${existing_disk_path}"
 
   if [[ "${mode}" == "single" ]]; then
     create_single_gpu_hooks "${vm_name}" "${user_name}" "${gpu_pci}" "${gpu_audio_pci}"
@@ -388,6 +405,14 @@ main() {
     run systemctl daemon-reload
     run systemctl enable --now passthrough-watchdog
     ui_kv "Watchdog" "enabled"
+  fi
+
+  if [[ "${looking_glass}" == "1" ]]; then
+    ui_section "Looking Glass Setup"
+    echo "Creating /dev/shm/looking-glass permission rule..."
+    printf 'f /dev/shm/looking-glass 0666 root root -\n' | run_maybe_sudo tee /etc/tmpfiles.d/10-looking-glass.conf >/dev/null
+    run_maybe_sudo systemd-tmpfiles --create /etc/tmpfiles.d/10-looking-glass.conf
+    ui_kv "Looking Glass SHM" "initialized (0666)"
   fi
 
   # ─── Install windows-vm global command ───────────────────────────────────

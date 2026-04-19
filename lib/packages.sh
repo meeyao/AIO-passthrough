@@ -20,10 +20,10 @@ packages_for_manager() {
       printf '%s\n' "qemu-full virt-manager virt-install dnsmasq bridge-utils edk2-ovmf swtpm pciutils libvirt mkinitcpio xorriso jq curl file libarchive p7zip"
       ;;
     apt)
-      printf '%s\n' "qemu-system-x86 qemu-utils virt-manager virtinst dnsmasq-base bridge-utils ovmf swtpm-tools pciutils libvirt-daemon-system libvirt-clients xorriso jq curl file libarchive-tools p7zip-full"
+      printf '%s\n' "qemu-system-x86 qemu-utils virt-manager virtinst dnsmasq-base bridge-utils ovmf swtpm-tools pciutils libvirt-daemon-system libvirt-clients xorriso jq curl file libarchive-tools p7zip-full looking-glass-client"
       ;;
     dnf)
-      printf '%s\n' "qemu-kvm qemu-img virt-manager virt-install dnsmasq bridge-utils edk2-ovmf swtpm pciutils libvirt libvirt-daemon-config-network xorriso jq curl file bsdtar p7zip"
+      printf '%s\n' "qemu-kvm qemu-img virt-manager virt-install dnsmasq bridge-utils edk2-ovmf swtpm pciutils libvirt libvirt-daemon-config-network xorriso jq curl file bsdtar p7zip looking-glass-client"
       ;;
     zypper)
       printf '%s\n' "qemu-kvm qemu-tools virt-manager virt-install dnsmasq bridge-utils ovmf swtpm pciutils libvirt xorriso jq curl file libarchive p7zip"
@@ -39,6 +39,7 @@ package_manager_note() {
   case "${manager}" in
     pacman)
       printf '%s\n' "AUR/yay is not required for the default toolchain."
+      printf '%s\n' "Note: looking-glass-client is in the AUR and must be installed manually."
       ;;
     *)
       printf '%s\n' ""
